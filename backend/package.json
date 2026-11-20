@@ -13,7 +13,10 @@
     "test": "node --test \"test/*.test.js\"",
     "test:unit": "node --test --test-skip-pattern=\"REAL NODE\" \"test/*.test.js\"",
     "test:e2e": "node --test test/e2e-bitcoind.test.js",
-    "regtest": "bash scripts/regtest-node.sh"
+    "regtest": "bash scripts/regtest-node.sh",
+    "simulate": "node scripts/simulate-flow.mjs",
+    "simulate:regtest": "node scripts/simulate-flow.mjs --mode regtest",
+    "simulate:signet": "node scripts/simulate-flow.mjs --mode signet"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^1.11.0",

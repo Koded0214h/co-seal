@@ -553,7 +553,7 @@ export async function signSettlement(order, { type, signerPubkey, signature, psb
     throw httpError(409, 'No pending settlement of this type to sign');
   }
 
-  if (!bitcoinLive) return signSimulated(order, settlement, type, signerPubkey);
+  if (!bitcoinLive) return signSimulated(order, settlement, type, signerPubkey, actorRoles);
 
   if (!psbt) throw httpError(400, 'psbt (base64, signed in your wallet) is required');
   const escrow = getEscrowByOrderId(order.id);
@@ -606,14 +606,30 @@ export async function signSettlement(order, { type, signerPubkey, signature, psb
   return { order: getOrderById(order.id), settlement: getSettlement(order.id, type), broadcast: true };
 }
 
-function signSimulated(order, settlement, type, signerPubkey) {
+function signSimulated(order, settlement, type, signerPubkey, actorRoles) {
   if (!signerPubkey) throw httpError(400, 'signerPubkey is required');
-  const signatures = parse(settlement.signatures) || [];
-  if (!signatures.some((s) => s.pubkey === signerPubkey)) signatures.push({ pubkey: signerPubkey, signedAt: now() });
+  const detail = parse(settlement.detail) || {};
+  const policy = detail.policy || signerPolicy(type, detail.trigger);
+  const known = parse(settlement.signatures) || [];
+
+  // Same rules as live mode, minus the cryptography: the submitter signs as ONE of their roles
+  // that the policy allows, and each role counts once.
+  let role = null;
+  if (actorRoles) {
+    role = ['BUYER', 'SELLER', 'ARBITRATOR'].find((r) => actorRoles.has(r) && policy.allowed.includes(r)) || null;
+    if (!role) throw httpError(403, `A ${type.toLowerCase()} settlement (${detail.trigger}) may only be signed by ${policy.allowed.join(' / ')}`);
+  }
+  const signatures = known.filter((sg) => !(role && sg.role === role));
+  signatures.push({ pubkey: signerPubkey, role, signedAt: now() });
   db.prepare('UPDATE settlements SET signatures = ? WHERE id = ?').run(JSON.stringify(signatures), settlement.id);
-  if (signatures.length < 2) {
+  recordEvent(order.id, 'SETTLEMENT_SIGNED', null, null, { type, role, pubkey: signerPubkey });
+
+  const satisfied = actorRoles ? policySatisfied(policy, signatures.map((sg) => sg.role)) : signatures.length >= 2;
+  if (!satisfied) {
     return { order: getOrderById(order.id), settlement: getSettlement(order.id, type), broadcast: false };
   }
+  const claim = db.prepare("UPDATE settlements SET status = 'BROADCASTING' WHERE id = ? AND status IN ('AWAITING_SIGNATURES','PROPOSED')").run(settlement.id);
+  if (claim.changes !== 1) return { order: getOrderById(order.id), settlement: getSettlement(order.id, type), broadcast: false };
   const txid = `sim-txid-${settlement.id.slice(-10)}`;
   db.prepare("UPDATE settlements SET status = 'BROADCAST', txid = ? WHERE id = ?").run(txid, settlement.id);
   finalizeSettlement(order, type, txid);

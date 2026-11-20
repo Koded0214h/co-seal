@@ -78,3 +78,42 @@ test('simulation mode: seller ACCEPT yields a refund proposal; AI unavailable ne
   assert.equal(a.body.state, 'AWAITING_SIGNATURES');
   assert.equal(a.body.settlements[0].type, 'REFUND');
 });
+
+test('simulation mode enforces the same signer policy as live mode', async () => {
+  const seller = await person(); const buyer = await person(); const arbUser = await person();
+  const o = (await api('POST', '/api/orders', { token: seller.token, json: { itemDescription: 'Kettle', amountSats: 60_000 } })).body;
+  await api('POST', `/api/orders/${o.ref}/join`, { token: buyer.token, json: { buyerPubkey: buyer.pubkey } });
+  await api('POST', `/api/orders/${o.ref}/simulate-funding`, { token: buyer.token });
+  const svc = await import('../src/services/orderService.js');
+  const { db } = await import('../src/db.js');
+  svc.markDispatched(svc.getOrderByRef(o.ref), { dispatchReference: 'x' });
+  await api('POST', `/api/orders/${o.ref}/deliver`, { token: seller.token, json: {} });
+  await api('POST', `/api/orders/${o.ref}/confirm`, { token: buyer.token, json: {} });
+  const sign = (who) => api('POST', `/api/orders/${o.ref}/sign`, { token: who.token, json: { type: 'RELEASE', signerPubkey: who.pubkey, signature: 's' } });
+
+  assert.equal((await sign(arbUser)).status, 403, 'non-participant');
+  db.prepare('UPDATE orders SET arbitrator_user_id = ? WHERE ref = ?').run(arbUser.user.id, o.ref); // assigned arbitrator
+  assert.equal((await sign(arbUser)).status, 403, 'arbitrator may not sign an undisputed (buyer-confirmed) release');
+  assert.equal((await sign(buyer)).body.state, 'AWAITING_SIGNATURES');
+  assert.equal((await sign(buyer)).body.state, 'AWAITING_SIGNATURES', 'the same role signing twice does not count twice');
+  assert.equal((await sign(seller)).body.state, 'RELEASED');
+});
+
+test('simulation mode: a split needs the arbitrator even if buyer and seller both sign', async () => {
+  const seller = await person(); const buyer = await person(); const arbUser = await person();
+  const o = (await api('POST', '/api/orders', { token: seller.token, json: { itemDescription: 'Mixer', amountSats: 90_000 } })).body;
+  const { db } = await import('../src/db.js');
+  db.prepare('UPDATE orders SET arbitrator_user_id = ? WHERE ref = ?').run(arbUser.user.id, o.ref);
+  await api('POST', `/api/orders/${o.ref}/join`, { token: buyer.token, json: { buyerPubkey: buyer.pubkey } });
+  await api('POST', `/api/orders/${o.ref}/simulate-funding`, { token: buyer.token });
+  const svc = await import('../src/services/orderService.js');
+  svc.markDispatched(svc.getOrderByRef(o.ref), { dispatchReference: 'x' });
+  await api('POST', `/api/orders/${o.ref}/deliver`, { token: seller.token, json: {} });
+  await api('POST', `/api/orders/${o.ref}/dispute`, { token: buyer.token, json: { reason: 'x' } });
+  await api('POST', `/api/orders/${o.ref}/seller-response`, { token: seller.token, json: { response: 'CONTEST' } });
+  assert.equal((await api('POST', `/api/orders/${o.ref}/resolve`, { token: arbUser.token, json: { decision: 'SPLIT', sellerShareBps: 6000 } })).body.state, 'AWAITING_SIGNATURES');
+  const sign = (who) => api('POST', `/api/orders/${o.ref}/sign`, { token: who.token, json: { type: 'SPLIT', signerPubkey: who.pubkey, signature: 's' } });
+  await sign(buyer);
+  assert.equal((await sign(seller)).body.state, 'AWAITING_SIGNATURES', 'buyer+seller cannot split alone');
+  assert.equal((await sign(arbUser)).body.state, 'SPLIT');
+});

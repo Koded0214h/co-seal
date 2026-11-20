@@ -12,6 +12,17 @@ npm run test:unit           # everything except the bitcoind e2e
 npm run test:e2e            # only the real Bitcoin Core regtest e2e
 ```
 
+## Full user-flow simulation
+
+A narrated walkthrough of every role through the real HTTP API (login, roles, escrow, dispatch, dispute, arbitration, signing, settlement, audit, admin view):
+
+```bash
+npm run simulate                      # simulation mode, no node needed (4 scenarios, ~60 checks)
+npm run regtest -- start && npm run simulate:regtest   # same journey on a REAL Bitcoin Core node
+npm run simulate:signet               # PUBLIC Signet: prints an escrow address, you fund it from a faucet
+```
+Scenarios: `--scenario happy | accept | split | timeout | all`. Exit code is non-zero on any failed check.
+
 ## Modes
 
 | Mode | Set | Behaviour |
