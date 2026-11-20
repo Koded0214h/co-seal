@@ -1,0 +1,21 @@
+{
+  "name": "coseal-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "CoSeal — non-custodial Bitcoin multisig escrow API with Nostr messaging and AI-assisted dispute evidence",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2",
+    "jimp": "^1.6.1",
+    "multer": "^2.2.0"
+  }
+}

@@ -1,0 +1,17 @@
+services:
+  coseal:
+    build:
+      context: ./backend
+    container_name: coseal-app
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8010:4000"
+    env_file:
+      - ./backend/.env
+    volumes:
+      - coseal-data:/app/data
+      - coseal-uploads:/app/uploads
+
+volumes:
+  coseal-data:
+  coseal-uploads:
