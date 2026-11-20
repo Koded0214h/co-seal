@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "CoSeal \u2014 non-custodial Bitcoin multisig escrow API with Nostr messaging and AI-assisted dispute evidence",
+  "description": "CoSeal — non-custodial Bitcoin multisig escrow API with Nostr messaging and AI-assisted dispute evidence",
   "engines": {
     "node": ">=22.5.0"
   },
@@ -20,6 +20,7 @@
     "express": "^4.21.2",
     "jimp": "^1.6.1",
     "multer": "^2.2.0",
+    "nostr-tools": "^2.26.1",
     "tiny-secp256k1": "^2.2.5"
   }
 }

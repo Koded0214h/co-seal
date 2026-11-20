@@ -74,7 +74,8 @@ CREATE TABLE IF NOT EXISTS evidence (
   stored_file   TEXT NOT NULL,                          -- filename under /uploads
   sha256        TEXT,                                   -- content hash of the original uploaded bytes
   note          TEXT,
-  captured_at   INTEGER NOT NULL
+  captured_at   INTEGER NOT NULL,                       -- SERVER receive time (trusted)
+  device_captured_at INTEGER                            -- claimed device capture time (UNVERIFIED)
 );
 CREATE INDEX IF NOT EXISTS idx_evidence_order ON evidence(order_id);
 
@@ -161,7 +162,8 @@ CREATE TABLE IF NOT EXISTS nostr_events (
   kind        INTEGER,
   author_pubkey TEXT,
   relay       TEXT,
-  created_at  INTEGER NOT NULL
+  created_at  INTEGER NOT NULL,
+  UNIQUE (order_id, event_id)
 );
 CREATE INDEX IF NOT EXISTS idx_nostr_events_order ON nostr_events(order_id);
 
@@ -173,9 +175,17 @@ CREATE TABLE IF NOT EXISTS events (
   from_state TEXT,
   to_state   TEXT,
   detail     TEXT,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  prev_hash  TEXT,                                       -- hash of the previous event for this order
+  hash       TEXT                                        -- sha256 over this event + prev_hash (tamper-evident chain)
 );
 CREATE INDEX IF NOT EXISTS idx_events_order ON events(order_id);
+
+-- FR-11: the history is append-only. The database itself refuses rewrites.
+CREATE TRIGGER IF NOT EXISTS events_no_update BEFORE UPDATE ON events
+BEGIN SELECT RAISE(ABORT, 'events is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS events_no_delete BEFORE DELETE ON events
+BEGIN SELECT RAISE(ABORT, 'events is append-only'); END;
 `);
 
 export function now() {

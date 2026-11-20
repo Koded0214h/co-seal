@@ -1,38 +1,66 @@
-import { config } from '../config.js';
+import { verifyEvent } from 'nostr-tools/pure';
+import { db, now } from '../db.js';
+import { uid } from './ids.js';
 
 /**
- * Nostr identity + messaging client — PRD §11 ("Technical architecture: Nostr") and FR-09.
+ * Nostr integration — PRD FR-09.
  *
- * NONE OF THIS IS IMPLEMENTED YET. Stubs only, same reasoning as lib/bitcoin.js. Real work
- * needed:
+ * Division of labour (PRD §9: the DB must not be the owner of private conversations):
+ *   - Clients (browser, NIP-07 signer) author, encrypt and publish messages themselves using
+ *     NIP-17 DMs (NIP-44 encryption inside NIP-59 gift wraps). The backend never sees keys or
+ *     plaintext.
+ *   - The backend stores only *references*: event id, kind, author, relay, timestamp, scoped to
+ *     an order. That gives transaction-linked conversations, an audit pointer, and the
+ *     arbitrator a list of "communication references relevant to the dispute".
  *
- *   - A Nostr client (NDK — @nostr-dev-kit/ndk — or similar) connected to config.nostr.relays.
- *   - NIP-07 browser-signer integration on the frontend for buyer/seller identities; this
- *     backend module only needs to publish/subscribe to transaction-linked event metadata,
- *     never hold a participant's private key.
- *   - NIP-17 (private DMs, itself built on NIP-44 encryption + NIP-59 gift-wrapping) for the
- *     actual buyer↔seller conversation — the backend should record event ids/refs in the
- *     `nostr_events` table (see db.js) but never the decrypted message content, per PRD §9.
- *   - Transaction notifications (a seller pinged on dispute, a buyer pinged on delivery) can
- *     either ride the same relays as a kind-appropriate event, or stay as the in-app
- *     `notifications` table (lib/notify.js) does today — PRD §FR-09/P1 treats Nostr push as
- *     an additional channel, not a replacement for the in-app notification.
+ * Linking convention: every message belonging to an order carries the tag
+ *   ["t", conversationTag(ref)]   (and the gift-wrapped rumor carries it inside the encryption)
+ * so a client can re-subscribe to its conversation from relays alone.
  */
 
-class NostrNotImplementedError extends Error {
-  constructor(fn) {
-    super(`backend/src/lib/nostr.js: ${fn}() is not implemented — see file header for what's needed.`);
-    this.name = 'NostrNotImplementedError';
-    this.status = 501;
+export const conversationTag = (ref) => `coseal:${ref}`;
+
+const HEX64 = /^[0-9a-f]{64}$/;
+const err = (status, message) => Object.assign(new Error(message), { status });
+
+/**
+ * Record a reference to a Nostr event for an order. Idempotent per (order, eventId).
+ * If the full signed `event` JSON is supplied, its id and signature are verified so a
+ * reference can't be forged for an event that doesn't exist / wasn't signed by `authorPubkey`.
+ * (Gift wraps are signed by throwaway keys, so the author is only checked when it's present.)
+ */
+export function recordEventReference({ orderId, eventId, kind, authorPubkey, relay, event }) {
+  if (event) {
+    // Strip symbol-keyed caches (nostr-tools memoises "verified" on the object) before verifying.
+    event = JSON.parse(JSON.stringify(event));
+    if (!verifyEvent(event)) throw err(400, 'Nostr event signature/id is invalid');
+    eventId = event.id;
+    kind = event.kind;
+    authorPubkey = event.pubkey;
   }
+  eventId = String(eventId || '').toLowerCase();
+  if (!HEX64.test(eventId)) throw err(400, 'eventId must be 64 hex characters');
+  if (authorPubkey && !HEX64.test(String(authorPubkey).toLowerCase())) throw err(400, 'authorPubkey must be a 64-hex Nostr pubkey');
+
+  const existing = db.prepare('SELECT * FROM nostr_events WHERE order_id = ? AND event_id = ?').get(orderId, eventId);
+  if (existing) return { reference: existing, fresh: false };
+
+  const id = uid('nev');
+  db.prepare(
+    `INSERT INTO nostr_events (id, order_id, event_id, kind, author_pubkey, relay, created_at) VALUES (?,?,?,?,?,?,?)`,
+  ).run(id, orderId, eventId, Number.isInteger(kind) ? kind : null, authorPubkey?.toLowerCase() || null, relay || null, now());
+  return { reference: db.prepare('SELECT * FROM nostr_events WHERE id = ?').get(id), fresh: true };
 }
 
-/** Record a reference to a Nostr event relevant to this order (not its private content). */
-export async function recordEventReference({ orderId, eventId, kind, authorPubkey, relay }) {
-  throw new NostrNotImplementedError('recordEventReference');
+export function listEventReferences(orderId) {
+  return db.prepare('SELECT * FROM nostr_events WHERE order_id = ? ORDER BY created_at ASC').all(orderId)
+    .map((r) => ({ eventId: r.event_id, kind: r.kind, authorPubkey: r.author_pubkey, relay: r.relay, recordedAt: r.created_at }));
 }
 
-/** Publish a transaction notification as a Nostr event (P1 — optional alongside in-app notify). */
-export async function publishNotification({ toPubkey, orderRef, body }) {
-  throw new NostrNotImplementedError('publishNotification');
+/** Set a participant's Nostr identity (so clients know whom to DM). */
+export function setParticipantNostrPubkey(orderId, role, nostrPubkey) {
+  const pk = String(nostrPubkey || '').toLowerCase();
+  if (!HEX64.test(pk)) throw err(400, 'nostrPubkey must be a 64-hex (x-only) pubkey');
+  const res = db.prepare('UPDATE participants SET nostr_pubkey = ? WHERE order_id = ? AND role = ?').run(pk, orderId, role);
+  if (res.changes !== 1) throw err(404, `No ${role} participant on this order`);
 }

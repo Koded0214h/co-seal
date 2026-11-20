@@ -32,3 +32,20 @@ export function hashUploadedFile(filename) {
   const buf = fs.readFileSync(path.join(config.paths.uploads, filename));
   return crypto.createHash('sha256').update(buf).digest('hex');
 }
+
+/** Detect the real image type from magic bytes — the client-supplied mimetype is not trusted. */
+export function sniffImageType(filename) {
+  const fd = fs.openSync(path.join(config.paths.uploads, filename), 'r');
+  const b = Buffer.alloc(12);
+  fs.readSync(fd, b, 0, 12, 0);
+  fs.closeSync(fd);
+  if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return 'image/jpeg';
+  if (b.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return 'image/png';
+  if (b.subarray(0, 4).toString('latin1') === 'RIFF' && b.subarray(8, 12).toString('latin1') === 'WEBP') return 'image/webp';
+  if (['GIF87a', 'GIF89a'].includes(b.subarray(0, 6).toString('latin1'))) return 'image/gif';
+  return null;
+}
+
+export function removeUpload(filename) {
+  try { fs.unlinkSync(path.join(config.paths.uploads, filename)); } catch { /* ignore */ }
+}

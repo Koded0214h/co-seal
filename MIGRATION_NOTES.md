@@ -49,7 +49,13 @@ Bitcoin/Nostr integration lands and these notes stop being useful.
   `amount`, `escrow.address` not a virtual bank account, pubkeys not bank accounts,
   settlements not transactions).
 
-## Explicitly stubbed — NOT implemented
+## UPDATE: Bitcoin + Nostr backend now implemented
+
+`lib/bitcoin.js`, `lib/chain.js` and `lib/nostr.js` are real (see ROADMAP.md). Set
+`BITCOIN_LIVE=true` + `ARBITRATOR_PUBKEY` for live mode; default remains simulation so the
+current frontend keeps working. The "stubbed" notes below are historical.
+
+## Explicitly stubbed — NOT implemented (historical)
 
 - **`backend/src/lib/bitcoin.js`** — every export throws `BitcoinNotImplementedError`.
   Needs: a Bitcoin Core RPC client or Esplora-style indexer, a P2WSH 2-of-3 script

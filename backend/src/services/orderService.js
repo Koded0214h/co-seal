@@ -1,18 +1,45 @@
+import crypto from 'node:crypto';
 import { db, now } from '../db.js';
 import { config, bitcoinLive, reviewWindowMs } from '../config.js';
 import { uid, orderRef } from '../lib/ids.js';
 import { STATES, assertTransition, STATE_LABELS } from '../stateMachine.js';
 import { sendNotification, listNotifications } from '../lib/notify.js';
-import { hashUploadedFile } from '../lib/upload.js';
+import { hashUploadedFile, sniffImageType, removeUpload } from '../lib/upload.js';
 import * as btc from '../lib/bitcoin.js';
+import * as nostr from '../lib/nostr.js';
 
 /* ─────────────────────────── helpers ─────────────────────────── */
 
-function recordEvent(orderId, type, fromState, toState, detail) {
+const eventHash = (prev, e) => crypto.createHash('sha256')
+  .update(JSON.stringify([prev || '', e.id, e.order_id, e.type, e.from_state, e.to_state, e.detail, e.created_at]))
+  .digest('hex');
+
+/** Append-only, hash-chained audit event (FR-11). Each hash commits to the previous one. */
+export function recordEvent(orderId, type, fromState, toState, detail) {
+  const prev = db.prepare('SELECT hash FROM events WHERE order_id = ? ORDER BY rowid DESC LIMIT 1').get(orderId)?.hash || null;
+  const e = {
+    id: uid('evt'), order_id: orderId, type, from_state: fromState || null, to_state: toState || null,
+    detail: detail ? JSON.stringify(detail) : null, created_at: now(),
+  };
   db.prepare(
-    `INSERT INTO events (id, order_id, type, from_state, to_state, detail, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
-  ).run(uid('evt'), orderId, type, fromState || null, toState || null, detail ? JSON.stringify(detail) : null, now());
+    `INSERT INTO events (id, order_id, type, from_state, to_state, detail, created_at, prev_hash, hash)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(e.id, e.order_id, e.type, e.from_state, e.to_state, e.detail, e.created_at, prev, eventHash(prev, e));
+}
+
+/** Public audit trail + chain verification. `valid:false` pinpoints the first broken link. */
+export function getEventHistory(order) {
+  const rows = db.prepare('SELECT * FROM events WHERE order_id = ? ORDER BY rowid ASC').all(order.id);
+  let prev = null;
+  let valid = true;
+  let brokenAt = null;
+  const events = rows.map((r) => {
+    const ok = r.prev_hash === prev && r.hash === eventHash(prev, r);
+    if (!ok && valid) { valid = false; brokenAt = r.id; }
+    prev = r.hash;
+    return { id: r.id, type: r.type, fromState: r.from_state, toState: r.to_state, detail: parse(r.detail), createdAt: r.created_at, prevHash: r.prev_hash, hash: r.hash };
+  });
+  return { orderRef: order.ref, valid, brokenAt, headHash: prev, events };
 }
 
 function setState(order, toState, detail) {
@@ -21,6 +48,14 @@ function setState(order, toState, detail) {
   recordEvent(order.id, 'TRANSITION', order.state, toState, detail);
   order.state = toState;
   return order;
+}
+
+/** Canonical hash of the agreed terms. Terms are immutable once accepted; a change = a new order/agreement. */
+export function agreementHash(o) {
+  return crypto.createHash('sha256').update(JSON.stringify([
+    o.item_description, o.amount_sats, o.seller_pubkey, o.delivery_conditions || null,
+    o.expected_delivery_at || null, o.dispute_terms || null,
+  ])).digest('hex');
 }
 
 export function getOrderByRef(ref) {
@@ -114,6 +149,7 @@ export async function createOrder(input) {
     STATES.CREATED, ts, ts,
   );
   recordEvent(id, 'CREATED', null, STATES.CREATED, { mode: bitcoinLive ? 'LIVE' : 'SIMULATION' });
+  recordEvent(id, 'AGREEMENT_ACCEPTED', null, null, { by: 'SELLER', agreementHash: agreementHash(getOrderById(id)) });
 
   addParticipant(id, 'SELLER', input.sellerPubkey, input.sellerPayoutAddress);
   if (input.buyerPubkey) addParticipant(id, 'BUYER', input.buyerPubkey, input.buyerPayoutAddress);
@@ -159,9 +195,14 @@ function attachEscrow(order, ref) {
 }
 
 /** Buyer opens the link and joins: supplies their key + payout address, which completes the escrow. */
-export function joinAsBuyer(order, { buyerPubkey, buyerPayoutAddress }) {
+export function joinAsBuyer(order, { buyerPubkey, buyerPayoutAddress, agreementHash: accepted }) {
   if (order.state !== STATES.CREATED || order.buyer_pubkey) {
     throw httpError(409, 'This transaction already has a buyer');
+  }
+  // The buyer must accept exactly the terms the seller committed to.
+  const expected = agreementHash(order);
+  if (accepted ? accepted !== expected : bitcoinLive) {
+    throw httpError(409, 'agreementHash must match the current agreement terms');
   }
   if (bitcoinLive) {
     btc.normalizePubkey(buyerPubkey, 'buyerPubkey');
@@ -174,6 +215,7 @@ export function joinAsBuyer(order, { buyerPubkey, buyerPayoutAddress }) {
   addParticipant(order.id, 'BUYER', buyerPubkey, buyerPayoutAddress);
   const fresh = getOrderById(order.id);
   recordEvent(order.id, 'BUYER_JOINED', null, null, { buyerPubkey });
+  recordEvent(order.id, 'AGREEMENT_ACCEPTED', null, null, { by: 'BUYER', agreementHash: expected });
   attachEscrow(fresh, fresh.ref);
   return getOrderById(order.id);
 }
@@ -636,14 +678,36 @@ export function saveDisputeAiComparison(orderId, comparison) {
     .run(JSON.stringify(comparison), now(), d.id);
 }
 
-export function addEvidence({ orderId, side, storedFile, category, note, mediaType = 'image' }) {
+export function addEvidence({ orderId, side, storedFile, category, note, mediaType = 'image', deviceCapturedAt }) {
   const id = uid('ev');
+  const sniffed = sniffImageType(storedFile);
+  if (!sniffed) {
+    removeUpload(storedFile);
+    throw httpError(415, 'File content is not a valid jpeg/png/webp/gif image');
+  }
   const sha256 = hashUploadedFile(storedFile);
+  const device = Number.isFinite(Number(deviceCapturedAt)) && Number(deviceCapturedAt) > 0 ? Number(deviceCapturedAt) : null;
   db.prepare(
-    `INSERT INTO evidence (id, order_id, side, category, media_type, stored_file, sha256, note, captured_at)
-     VALUES (?,?,?,?,?,?,?,?,?)`,
-  ).run(id, orderId, side, category || null, mediaType, storedFile, sha256, note || null, now());
+    `INSERT INTO evidence (id, order_id, side, category, media_type, stored_file, sha256, note, captured_at, device_captured_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?)`,
+  ).run(id, orderId, side, category || null, mediaType, storedFile, sha256, note || null, now(), device);
+  recordEvent(orderId, 'EVIDENCE_SUBMITTED', null, null, { evidenceId: id, side, category: category || null, sha256, contentType: sniffed });
   return db.prepare('SELECT * FROM evidence WHERE id = ?').get(id);
+}
+
+/** FR-10/§9: recompute the hash from the stored original bytes and compare with the recorded one. */
+export function verifyEvidence(orderId, evidenceId) {
+  const ev = db.prepare('SELECT * FROM evidence WHERE id = ? AND order_id = ?').get(evidenceId, orderId);
+  if (!ev) throw httpError(404, 'Evidence not found');
+  let recomputed = null;
+  try { recomputed = hashUploadedFile(ev.stored_file); } catch { /* file missing */ }
+  return {
+    evidenceId: ev.id, recordedSha256: ev.sha256, recomputedSha256: recomputed,
+    match: recomputed != null && recomputed === ev.sha256,
+    serverReceivedAt: ev.captured_at,
+    deviceCapturedAt: ev.device_captured_at, deviceCapturedAtVerified: false,
+    note: 'A matching hash proves the file is unchanged since upload; it does not prove when or where the photo was taken.',
+  };
 }
 export function listEvidence(orderId) {
   return db.prepare('SELECT * FROM evidence WHERE order_id = ? ORDER BY captured_at ASC').all(orderId);
@@ -673,10 +737,12 @@ function parse(json) {
 
 export function serializeOrder(order) {
   const escrow = getEscrowByOrderId(order.id);
-  const participants = listParticipants(order.id).map((p) => ({ role: p.role, pubkey: p.pubkey, payoutAddress: p.payout_address }));
+  const participants = listParticipants(order.id).map((p) => ({ role: p.role, pubkey: p.pubkey, nostrPubkey: p.nostr_pubkey, payoutAddress: p.payout_address }));
   const evidence = listEvidence(order.id).map((e) => ({
     id: e.id, side: e.side, category: e.category, mediaType: e.media_type,
-    url: `/uploads/${e.stored_file}`, sha256: e.sha256, note: e.note, capturedAt: e.captured_at,
+    url: `/uploads/${e.stored_file}`, sha256: e.sha256, note: e.note,
+    capturedAt: e.captured_at, // server-received time (trusted)
+    deviceCapturedAt: e.device_captured_at, deviceCapturedAtVerified: false, // claimed by the uploader, unverified
   }));
   const assessments = listAssessments(order.id).map((a) => ({
     id: a.id, evidenceId: a.evidence_id, available: Boolean(a.available), assessment: parse(a.assessment), createdAt: a.created_at,
@@ -718,6 +784,9 @@ export function serializeOrder(order) {
     createdAt: order.created_at,
     updatedAt: order.updated_at,
     transactionLink: `${config.appBaseUrl}/t/${order.ref}`,
+    agreementHash: agreementHash(order),
+    conversationTag: nostr.conversationTag(order.ref),
+    nostrEvents: nostr.listEventReferences(order.id),
     evidence,
     assessments,
     settlements,
@@ -729,4 +798,25 @@ export function serializeOrder(order) {
       aiComparison: parse(dispute.ai_comparison), createdAt: dispute.created_at,
     } : null,
   };
+}
+
+/* ─────────────── escrow verification + Nostr references ─────────────── */
+
+export function verifyEscrowRecord(escrow) {
+  return bitcoinLive ? btc.verifyEscrow(escrow) : { valid: null, simulated: true };
+}
+
+export function setNostrIdentity(order, role, nostrPubkey) {
+  nostr.setParticipantNostrPubkey(order.id, role, nostrPubkey);
+  recordEvent(order.id, 'NOSTR_IDENTITY_SET', null, null, { role, nostrPubkey: String(nostrPubkey).toLowerCase() });
+}
+
+export function addNostrRef(order, ref) {
+  const r = nostr.recordEventReference({ orderId: order.id, ...ref });
+  if (r.fresh) recordEvent(order.id, 'NOSTR_EVENT_REFERENCED', null, null, { eventId: r.reference.event_id, kind: r.reference.kind });
+  return r;
+}
+
+export function listNostrRefs(order) {
+  return nostr.listEventReferences(order.id);
 }

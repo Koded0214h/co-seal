@@ -51,9 +51,42 @@ router.get('/:ref', loadOrder, ah(async (req, res) => {
 
 /* Buyer opens the link and joins with their key + payout address → completes the 2-of-3 escrow. */
 router.post('/:ref/join', loadOrder, ah(async (req, res) => {
-  const { buyerPubkey, buyerPayoutAddress } = req.body || {};
-  const order = svc.joinAsBuyer(req.order, { buyerPubkey: String(buyerPubkey || '').trim(), buyerPayoutAddress: String(buyerPayoutAddress || '').trim() });
+  const { buyerPubkey, buyerPayoutAddress, agreementHash } = req.body || {};
+  const order = svc.joinAsBuyer(req.order, { buyerPubkey: String(buyerPubkey || '').trim(), buyerPayoutAddress: String(buyerPayoutAddress || '').trim(), agreementHash });
   res.json(svc.serializeOrder(order));
+}));
+
+/* FR-11: public, hash-chained audit history (verifiable by anyone with the link). */
+router.get('/:ref/events', loadOrder, ah(async (req, res) => {
+  res.json(svc.getEventHistory(req.order));
+}));
+
+/* FR-02: anyone can recompute and verify the escrow from the three keys. */
+router.get('/:ref/escrow/verify', loadOrder, ah(async (req, res) => {
+  const escrow = svc.getEscrowByOrderId(req.order.id);
+  if (!escrow) return bad(res, 'No escrow yet — waiting for the buyer to join', 404);
+  res.json({ address: escrow.address, ...svc.verifyEscrowRecord(escrow) });
+}));
+
+/* §9: recompute an evidence file's SHA-256 from the stored original bytes. */
+router.get('/:ref/evidence/:evidenceId/verify', loadOrder, ah(async (req, res) => {
+  res.json(svc.verifyEvidence(req.order.id, req.params.evidenceId));
+}));
+
+/* FR-09: Nostr identity + message references (content stays on relays, encrypted). */
+router.post('/:ref/nostr/identity', loadOrder, ah(async (req, res) => {
+  const role = String(req.body?.role || '').toUpperCase();
+  if (!['BUYER', 'SELLER', 'ARBITRATOR'].includes(role)) return bad(res, 'role must be BUYER | SELLER | ARBITRATOR');
+  svc.setNostrIdentity(req.order, role, req.body?.nostrPubkey);
+  res.json(svc.serializeOrder(req.order));
+}));
+router.get('/:ref/nostr/events', loadOrder, ah(async (req, res) => {
+  res.json({ conversationTag: svc.serializeOrder(req.order).conversationTag, events: svc.listNostrRefs(req.order) });
+}));
+router.post('/:ref/nostr/events', loadOrder, ah(async (req, res) => {
+  const { eventId, kind, authorPubkey, relay, event } = req.body || {};
+  const r = svc.addNostrRef(req.order, { eventId, kind, authorPubkey, relay, event });
+  res.status(r.fresh ? 201 : 200).json(r.reference);
 }));
 
 /* DEMO: simulate Bitcoin funding landing (stands in for a real Signet transfer). */
@@ -88,6 +121,7 @@ router.post('/:ref/dispatch', loadOrder, upload.single('proof'), ah(async (req, 
   const evidence = svc.addEvidence({
     orderId: order.id, side: 'SELLER', storedFile: req.file.filename,
     category: 'dispatch', note: dispatchReference ? `Dispatch ref: ${dispatchReference}` : null,
+    deviceCapturedAt: req.body?.deviceCapturedAt,
   });
   svc.addAssessment({ orderId: order.id, evidenceId: evidence.id, assessment });
 
@@ -158,7 +192,7 @@ router.post('/:ref/dispute', loadOrder, upload.single('proof'), ah(async (req, r
     } else {
       assessment = await ai.verifyProblemProof({ filePath: problemPath, itemDescription: order.item_description, complaint: reason });
     }
-    const evidence = svc.addEvidence({ orderId: order.id, side: 'BUYER', storedFile: req.file.filename, category: category || 'problem', note: reason });
+    const evidence = svc.addEvidence({ orderId: order.id, side: 'BUYER', storedFile: req.file.filename, category: category || 'problem', note: reason, deviceCapturedAt: req.body?.deviceCapturedAt });
     svc.addAssessment({ orderId: order.id, evidenceId: evidence.id, assessment });
   }
 

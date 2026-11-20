@@ -65,9 +65,10 @@ test('order waits in CREATED until the buyer joins, then escrow is minted', asyn
   const order = await svc.createOrder({ itemDescription: 'Radio', amountSats: 50_000, sellerPubkey: fresh.s, sellerPayoutAddress: payoutAddress() });
   assert.equal(order.state, 'CREATED');
   assert.equal(escrowOf(order), undefined);
-  const joined = svc.joinAsBuyer(order, { buyerPubkey: fresh.b, buyerPayoutAddress: payoutAddress() });
+  const joined = svc.joinAsBuyer(order, { buyerPubkey: fresh.b, buyerPayoutAddress: payoutAddress(), agreementHash: svc.agreementHash(order) });
   assert.equal(joined.state, 'AWAITING_FUNDING');
   assert.ok(escrowOf(joined).address);
+  assert.throws(() => svc.joinAsBuyer(get(order), { buyerPubkey: newKey().pubkey, buyerPayoutAddress: payoutAddress(), agreementHash: 'deadbeef' }), /already has a buyer/);
   assert.throws(() => svc.joinAsBuyer(get(order), { buyerPubkey: fresh.b, buyerPayoutAddress: payoutAddress() }), /already has a buyer/);
 });
 
