@@ -6,7 +6,7 @@ import ordersRouter from './routes/orders.js';
 import blockchainRouter from './routes/blockchain.js';
 import adminRouter from './routes/admin.js';
 import metaRouter from './routes/meta.js';
-import { runReviewWindowSweep } from './services/orderService.js';
+import { runReviewWindowSweep, runChainSweep } from './services/orderService.js';
 
 const app = express();
 app.disable('x-powered-by');
@@ -54,8 +54,22 @@ const sweep = setInterval(async () => {
 }, SWEEP_MS);
 sweep.unref?.();
 
+// Chain watcher: funding detection (with confirmation policy), settlement confirmations and
+// reorg detection. No-op in simulation mode.
+const chainSweep = setInterval(async () => {
+  try {
+    const r = await runChainSweep();
+    if (r.funded.length) console.log(`[chain] funded: ${r.funded.join(', ')}`);
+    if (r.lost.length) console.warn(`[chain] funding output missing: ${r.lost.join(', ')}`);
+  } catch (err) {
+    console.error('[chain] sweep error:', err.message);
+  }
+}, 15_000);
+chainSweep.unref?.();
+
 function shutdown() {
   clearInterval(sweep);
+  clearInterval(chainSweep);
   server.close(() => process.exit(0));
 }
 process.on('SIGINT', shutdown);

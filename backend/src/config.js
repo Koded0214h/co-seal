@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, '..');
+const dataDir = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(root, 'data');
 
 const bool = (v, d = false) => (v == null ? d : /^(1|true|yes|on)$/i.test(String(v).trim()));
 const num = (v, d) => {
@@ -19,8 +20,8 @@ export const config = {
 
   paths: {
     root,
-    data: path.join(root, 'data'),
-    db: path.join(root, 'data', 'coseal.db'),
+    data: dataDir,
+    db: path.join(dataDir, 'coseal.db'),
     uploads: path.join(root, 'uploads'),
   },
 
@@ -29,6 +30,11 @@ export const config = {
   // bitcoind RPC client (or an Esplora/electrum-style indexer for funding detection) here.
   bitcoin: {
     network: (process.env.BITCOIN_NETWORK || 'signet').trim(), // signet only for the hackathon MVP
+    // BITCOIN_LIVE=true switches off simulation: real P2WSH escrows, Esplora funding detection,
+    // real PSBT signing + broadcast. Requires ARBITRATOR_PUBKEY.
+    live: bool(process.env.BITCOIN_LIVE, false),
+    esploraUrl: (process.env.BITCOIN_ESPLORA_URL || 'https://mempool.space/signet/api').replace(/\/$/, ''),
+    feeRate: num(process.env.BITCOIN_FEE_RATE, 2), // sat/vB
     rpcUrl: (process.env.BITCOIN_RPC_URL || 'http://127.0.0.1:38332').replace(/\/$/, ''),
     rpcUser: process.env.BITCOIN_RPC_USER || '',
     rpcPassword: process.env.BITCOIN_RPC_PASSWORD || '',
@@ -67,12 +73,14 @@ export const config = {
 };
 
 /**
- * SIMULATION mode: until the Bitcoin RPC + escrow-script integration lands (see
- * backend/src/lib/bitcoin.js), CoSeal simulates escrow generation + funding detection
- * locally so the state machine, AI layer and arbitration flow can run and demo end-to-end.
- * Flips true automatically once a real bitcoind RPC connection is wired up.
+ * SIMULATION mode (default): fake escrow address / funding / txids so the state machine, AI
+ * layer and arbitration flow can be demoed without a chain. BITCOIN_LIVE=true uses the real
+ * Bitcoin path in lib/bitcoin.js.
  */
-export const bitcoinLive = false;
+export const bitcoinLive = config.bitcoin.live;
+if (bitcoinLive && !config.bitcoin.arbitratorPubkey) {
+  throw new Error('BITCOIN_LIVE=true requires ARBITRATOR_PUBKEY (33-byte compressed hex)');
+}
 
 /** How long the buyer review window stays open, in milliseconds. */
 export function reviewWindowMs() {
@@ -86,8 +94,9 @@ export function summarizeConfig() {
   return {
     env: config.env,
     port: config.port,
-    bitcoinMode: bitcoinLive ? `LIVE (${config.bitcoin.network})` : 'SIMULATION (bitcoin RPC not wired up)',
+    bitcoinMode: bitcoinLive ? `LIVE (${config.bitcoin.network})` : 'SIMULATION (set BITCOIN_LIVE=true)',
     bitcoinNetwork: config.bitcoin.network,
+    esplora: bitcoinLive ? config.bitcoin.esploraUrl : undefined,
     arbitratorPubkeyConfigured: Boolean(config.bitcoin.arbitratorPubkey),
     nostrRelays: config.nostr.relays,
     llmModel: config.llm.model,

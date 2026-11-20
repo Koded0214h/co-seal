@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS participants (
   role       TEXT NOT NULL,                           -- BUYER | SELLER | ARBITRATOR
   pubkey     TEXT NOT NULL,                           -- Bitcoin pubkey used in the 2-of-3 multisig
   nostr_pubkey TEXT,                                  -- Nostr identity, if different
+  payout_address TEXT,                                -- where this party is paid on settlement
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_participants_order ON participants(order_id);
@@ -56,7 +57,7 @@ CREATE TABLE IF NOT EXISTS escrows (
   network         TEXT NOT NULL DEFAULT 'signet',
   redeem_script   TEXT,                                -- hex
   witness_script  TEXT,                                -- hex
-  address         TEXT,                                -- the funding address derived from the script
+  address         TEXT UNIQUE,                         -- funding address; UNIQUE so two orders can never share an escrow
   buyer_pubkey    TEXT,
   seller_pubkey   TEXT,
   arbitrator_pubkey TEXT,

@@ -23,7 +23,7 @@ function bad(res, msg, code = 400) {
 
 /* FR-01: seller creates a transaction → mints the isolated escrow, returns the shareable link. */
 router.post('/', ah(async (req, res) => {
-  const { itemDescription, amountSats, sellerPubkey, sellerName, buyerPubkey, deliveryConditions, expectedDeliveryAt, disputeTerms } = req.body || {};
+  const { itemDescription, amountSats, sellerPubkey, sellerName, buyerPubkey, sellerPayoutAddress, buyerPayoutAddress, deliveryConditions, expectedDeliveryAt, disputeTerms } = req.body || {};
   if (!itemDescription || String(itemDescription).trim().length < 2) return bad(res, 'itemDescription is required');
   const amt = Number(amountSats);
   if (!Number.isInteger(amt) || amt <= 0) return bad(res, 'amountSats must be a positive integer');
@@ -35,6 +35,8 @@ router.post('/', ah(async (req, res) => {
     sellerPubkey: String(sellerPubkey).trim(),
     sellerName: sellerName?.trim(),
     buyerPubkey: buyerPubkey?.trim(),
+    sellerPayoutAddress: sellerPayoutAddress?.trim(),
+    buyerPayoutAddress: buyerPayoutAddress?.trim(),
     deliveryConditions: deliveryConditions?.trim(),
     expectedDeliveryAt: expectedDeliveryAt ? Number(expectedDeliveryAt) : null,
     disputeTerms: disputeTerms?.trim(),
@@ -45,6 +47,13 @@ router.post('/', ah(async (req, res) => {
 /* Public transaction view (buyer/seller share this). */
 router.get('/:ref', loadOrder, ah(async (req, res) => {
   res.json(svc.serializeOrder(req.order));
+}));
+
+/* Buyer opens the link and joins with their key + payout address → completes the 2-of-3 escrow. */
+router.post('/:ref/join', loadOrder, ah(async (req, res) => {
+  const { buyerPubkey, buyerPayoutAddress } = req.body || {};
+  const order = svc.joinAsBuyer(req.order, { buyerPubkey: String(buyerPubkey || '').trim(), buyerPayoutAddress: String(buyerPayoutAddress || '').trim() });
+  res.json(svc.serializeOrder(order));
 }));
 
 /* DEMO: simulate Bitcoin funding landing (stands in for a real Signet transfer). */
@@ -167,10 +176,12 @@ router.post('/:ref/seller-response', loadOrder, ah(async (req, res) => {
 
 /* A participant submits their signature over the currently-proposed settlement PSBT. */
 router.post('/:ref/sign', loadOrder, ah(async (req, res) => {
-  const { type, signerPubkey, signature } = req.body || {};
+  const { type, signerPubkey, signature, psbt } = req.body || {};
   if (!['RELEASE', 'REFUND', 'SPLIT'].includes(String(type).toUpperCase())) return bad(res, 'type must be RELEASE | REFUND | SPLIT');
-  if (!signerPubkey || !signature) return bad(res, 'signerPubkey and signature are required');
-  const result = await svc.signSettlement(req.order, { type: String(type).toUpperCase(), signerPubkey, signature });
+  // Live mode: `psbt` is the base64 PSBT the participant signed in their own wallet.
+  // Simulation mode keeps the legacy { signerPubkey, signature } shape.
+  if (!psbt && (!signerPubkey || !signature)) return bad(res, 'psbt (signed, base64) is required');
+  const result = await svc.signSettlement(req.order, { type: String(type).toUpperCase(), signerPubkey, signature, psbt });
   res.json(svc.serializeOrder(result.order));
 }));
 
