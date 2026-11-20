@@ -1,7 +1,7 @@
 import bitcoin from 'bitcoinjs-lib';
 import * as ecc from 'tiny-secp256k1';
 import { config } from '../config.js';
-import { EsploraChain } from './chain.js';
+import { EsploraChain, BitcoindChain } from './chain.js';
 
 /**
  * Bitcoin escrow + settlement — PRD §11, FR-02, FR-03, FR-08.
@@ -22,6 +22,7 @@ const POLICY_DUST_SATS = 546;
 // vsize of a 1-input 2-of-3 P2WSH spend: ~11 overhead + 41 input + ~64 witness + 43 per output.
 const VSIZE_BASE = 116;
 const VSIZE_PER_OUTPUT = 43;
+const VSIZE_PER_INPUT = 105; // extra 2-of-3 P2WSH input: 41 + ~64 witness
 
 export function getNetwork(name = config.bitcoin.network) {
   switch (name) {
@@ -46,7 +47,11 @@ export class BitcoinError extends Error {
 
 let _chain = null;
 export function getChain() {
-  if (!_chain) _chain = new EsploraChain(config.bitcoin.esploraUrl);
+  if (!_chain) {
+    _chain = config.bitcoin.chain === 'rpc'
+      ? new BitcoindChain({ url: config.bitcoin.rpcUrl, user: config.bitcoin.rpcUser, password: config.bitcoin.rpcPassword, wallet: config.bitcoin.rpcWallet })
+      : new EsploraChain(config.bitcoin.esploraUrl);
+  }
   return _chain;
 }
 /** Swap the chain backend (tests, bitcoind adapter, demos). */
@@ -108,34 +113,47 @@ export function verifyEscrow(escrow) {
 /* ───────────────────────── funding detection ───────────────────────── */
 
 /**
- * FR-03. Look at the escrow address on-chain. Returns the best candidate funding output:
- *   { txid, vout, amountSats, confirmations, confirmed, sufficient }
- * or null if nothing is paid to the address. Confirmations are recomputed from the live tip
- * on every call, so a reorg that unconfirms/drops the output is visible on the next poll.
+ * FR-03. Look at the escrow address on-chain. Returns null if nothing is paid to it, otherwise
+ *   { txid, vout, amountSats, confirmedSats, confirmations, sufficient, utxos[] }
+ * where `confirmedSats` only counts outputs with >= minConfirmations, and `sufficient` means
+ * those alone cover `expectedSats` (so a payment split over several txs still funds the order).
+ * Confirmations come from the live tip on every call, so a reorg is visible on the next poll.
  */
-export async function getEscrowFundingStatus(address, { expectedSats = 0 } = {}) {
+export async function getEscrowFundingStatus(address, { expectedSats = 0, minConfirmations = config.bitcoin.minConfirmations } = {}) {
   const chain = getChain();
   const [utxos, tip] = await Promise.all([chain.getUtxos(address), chain.getTipHeight()]);
   if (!utxos.length) return null;
 
-  const withConf = utxos.map((u) => ({
-    txid: u.txid,
-    vout: u.vout,
-    amountSats: u.value,
-    confirmed: u.confirmed,
+  const list = utxos.map((u) => ({
+    txid: u.txid, vout: u.vout, amountSats: u.value, confirmed: u.confirmed,
     confirmations: u.confirmed && u.blockHeight != null ? Math.max(1, tip - u.blockHeight + 1) : 0,
-    sufficient: u.value >= expectedSats,
-  }));
-  // Prefer a sufficient output, then the most-confirmed, then the largest.
-  withConf.sort((a, b) =>
-    Number(b.sufficient) - Number(a.sufficient) || b.confirmations - a.confirmations || b.amountSats - a.amountSats);
-  return withConf[0];
+  })).sort((a, b) => b.amountSats - a.amountSats);
+
+  const counted = list.filter((u) => u.confirmations >= Math.max(1, minConfirmations));
+  const confirmedSats = counted.reduce((n, u) => n + u.amountSats, 0);
+  const primary = counted[0] || list[0];
+  return {
+    txid: primary.txid,
+    vout: primary.vout,
+    amountSats: list.reduce((n, u) => n + u.amountSats, 0),
+    confirmedSats,
+    confirmations: Math.max(...list.map((u) => u.confirmations)),
+    sufficient: confirmedSats >= expectedSats,
+    utxos: list,
+  };
+}
+
+/** All escrow outputs that have enough confirmations — what a settlement spends (nothing is stranded). */
+export async function getSpendableUtxos(address, { minConfirmations = config.bitcoin.minConfirmations } = {}) {
+  const status = await getEscrowFundingStatus(address, { minConfirmations });
+  if (!status) return [];
+  return status.utxos.filter((u) => u.confirmations >= Math.max(1, minConfirmations));
 }
 
 /* ───────────────────────── PSBT build / inspect ───────────────────────── */
 
-export function estimateFeeSats(outputCount, feeRate = config.bitcoin.feeRate) {
-  return Math.ceil((VSIZE_BASE + VSIZE_PER_OUTPUT * outputCount) * feeRate);
+export function estimateFeeSats(outputCount, feeRate = config.bitcoin.feeRate, inputCount = 1) {
+  return Math.ceil((VSIZE_BASE + VSIZE_PER_INPUT * (inputCount - 1) + VSIZE_PER_OUTPUT * outputCount) * feeRate);
 }
 
 /**
@@ -143,25 +161,31 @@ export function estimateFeeSats(outputCount, feeRate = config.bitcoin.feeRate) {
  * Any difference between UTXO value and outputs is the miner fee; it is validated here so a
  * proposal can never silently burn funds to fees.
  */
-export function buildSettlementPsbt({ escrow, utxo, outputs, network }) {
+export function buildSettlementPsbt({ escrow, utxos, utxo, outputs, network }) {
   const net = getNetwork(network || escrow.network);
+  const inputs = utxos || [utxo];
+  if (!inputs.length) throw new BitcoinError('No escrow outputs to spend');
   if (!outputs?.length) throw new BitcoinError('Settlement needs at least one output');
 
-  const total = outputs.reduce((s, o) => s + o.amountSats, 0);
-  const fee = utxo.amountSats - total;
-  const maxFee = estimateFeeSats(outputs.length, Math.max(config.bitcoin.feeRate * 10, 20));
+  const inValue = inputs.reduce((n, u) => n + u.amountSats, 0);
+  const total = outputs.reduce((n, o) => n + o.amountSats, 0);
+  const fee = inValue - total;
+  const maxFee = estimateFeeSats(outputs.length, Math.max(config.bitcoin.feeRate * 10, 20), inputs.length);
   if (fee < 0) throw new BitcoinError('Outputs exceed escrow value');
   if (fee > maxFee) throw new BitcoinError(`Fee ${fee} sats is unreasonably high (max ${maxFee})`);
 
   const witnessScript = Buffer.from(escrow.witness_script, 'hex');
+  const script = bitcoin.payments.p2wsh({ redeem: { output: witnessScript, network: net }, network: net }).output;
   const psbt = new bitcoin.Psbt({ network: net });
   psbt.setVersion(2);
-  psbt.addInput({
-    hash: utxo.txid,
-    index: utxo.vout,
-    witnessUtxo: { script: bitcoin.payments.p2wsh({ redeem: { output: witnessScript, network: net }, network: net }).output, value: utxo.amountSats },
-    witnessScript,
-  });
+  for (const u of inputs) {
+    psbt.addInput({
+      hash: u.txid, index: u.vout,
+      sequence: 0xfffffffd, // BIP-125 opt-in RBF, so a stuck settlement can be fee-bumped
+      witnessUtxo: { script, value: u.amountSats },
+      witnessScript,
+    });
+  }
   for (const o of outputs) {
     if (o.amountSats < POLICY_DUST_SATS) throw new BitcoinError(`Output of ${o.amountSats} sats is below dust`);
     psbt.addOutput({ address: o.address, value: o.amountSats });
@@ -180,7 +204,7 @@ export function inspectPsbt(base64, { network = config.bitcoin.network } = {}) {
     inputs: psbt.txInputs.map((i) => ({ txid: Buffer.from(i.hash).reverse().toString('hex'), vout: i.index })),
     outputs,
     feeSats: inValue - outValue,
-    signers: psbt.data.inputs.flatMap((i) => (i.partialSig || []).map((p) => p.pubkey.toString('hex'))),
+    signers: signersOfAllInputs(psbt),
   };
 }
 
@@ -212,14 +236,22 @@ export function mergeSignedPsbt({ storedBase64, submittedBase64, escrow }) {
     }
   }
   try {
-    if (!submitted.validateSignaturesOfInput(0, validator)) throw new Error('invalid signature');
+    for (let i = 0; i < submitted.data.inputs.length; i++) {
+      if ((submitted.data.inputs[i].partialSig || []).length && !submitted.validateSignaturesOfInput(i, validator)) throw new Error(`invalid signature on input ${i}`);
+    }
   } catch (err) {
     throw new BitcoinError(`Signature verification failed: ${err.message}`, 400);
   }
 
   stored.combine(submitted);
-  const signers = (stored.data.inputs[0].partialSig || []).map((p) => p.pubkey.toString('hex'));
-  return { base64: stored.toBase64(), signers };
+  // A key only counts as a signer if it signed EVERY input (otherwise the tx can't be finalized).
+  return { base64: stored.toBase64(), signers: signersOfAllInputs(stored) };
+}
+
+function signersOfAllInputs(psbt) {
+  const sets = psbt.data.inputs.map((i) => new Set((i.partialSig || []).map((p) => p.pubkey.toString('hex'))));
+  if (!sets.length) return [];
+  return [...sets[0]].filter((pk) => sets.every((st) => st.has(pk)));
 }
 
 function sameUnsignedTx(a, b) {
@@ -229,22 +261,26 @@ function sameUnsignedTx(a, b) {
     Buffer.compare(i.hash, b.txInputs[n].hash) === 0 && i.index === b.txInputs[n].index && i.sequence === b.txInputs[n].sequence);
   const outs = a.txOutputs.every((o, n) =>
     Buffer.compare(o.script, b.txOutputs[n].script) === 0 && o.value === b.txOutputs[n].value);
-  const utxo = Buffer.compare(a.data.inputs[0].witnessUtxo.script, b.data.inputs[0].witnessUtxo.script) === 0
-    && a.data.inputs[0].witnessUtxo.value === b.data.inputs[0].witnessUtxo.value;
+  const utxo = a.data.inputs.every((ai, n) => {
+    const bi = b.data.inputs[n];
+    return bi?.witnessUtxo && Buffer.compare(ai.witnessUtxo.script, bi.witnessUtxo.script) === 0 && ai.witnessUtxo.value === bi.witnessUtxo.value;
+  });
   return ins && outs && utxo;
 }
 
 /** Finalize a PSBT holding >= 2 valid signatures and return the raw tx. */
-export function finalizeSettlementPsbt(base64, { network = config.bitcoin.network } = {}) {
+export function finalizeSettlementPsbt(base64, { network = config.bitcoin.network, preferKey } = {}) {
   const psbt = bitcoin.Psbt.fromBase64(base64, { network: getNetwork(network) });
-  if (!psbt.validateSignaturesOfInput(0, validator)) throw new BitcoinError('PSBT signatures invalid');
-  // A 2-of-3 script rejects extra signatures. Keep exactly 2, preferring the arbitrator's when
-  // present (SPLIT collects all three).
-  const input = psbt.data.inputs[0];
-  if ((input.partialSig || []).length > 2) {
-    const arb = config.bitcoin.arbitratorPubkey;
-    const sigs = [...input.partialSig].sort((a, b) => Number(b.pubkey.toString('hex') === arb) - Number(a.pubkey.toString('hex') === arb));
-    input.partialSig = sigs.slice(0, 2);
+  for (let i = 0; i < psbt.data.inputs.length; i++) {
+    if (!psbt.validateSignaturesOfInput(i, validator)) throw new BitcoinError('PSBT signatures invalid');
+    // A 2-of-3 script rejects extra signatures. Keep exactly 2, preferring the arbitrator's
+    // (SPLIT collects all three).
+    const input = psbt.data.inputs[i];
+    if ((input.partialSig || []).length > 2) {
+      const arb = (preferKey || config.bitcoin.arbitratorPubkey || '').toLowerCase();
+      const sigs = [...input.partialSig].sort((a, b) => Number(b.pubkey.toString('hex') === arb) - Number(a.pubkey.toString('hex') === arb));
+      input.partialSig = sigs.slice(0, 2);
+    }
   }
   try {
     psbt.finalizeAllInputs();
@@ -256,8 +292,8 @@ export function finalizeSettlementPsbt(base64, { network = config.bitcoin.networ
 }
 
 /** Finalize and broadcast. Safe to retry: an "already known" rejection resolves to the same txid. */
-export async function broadcastSettlement({ psbt, network }) {
-  const { hex, txid } = finalizeSettlementPsbt(psbt, { network });
+export async function broadcastSettlement({ psbt, network, preferKey }) {
+  const { hex, txid } = finalizeSettlementPsbt(psbt, { network, preferKey });
   const chain = getChain();
   try {
     await chain.broadcast(hex, txid);

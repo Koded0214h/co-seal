@@ -39,11 +39,8 @@ const TRANSITIONS = {
   // a backend timer can't itself move Bitcoin, so it escalates into the same human-decision
   // path a contested dispute would, rather than auto-releasing).
   REVIEW_PENDING: [STATES.AWAITING_SIGNATURES, STATES.DISPUTED, STATES.UNDER_REVIEW],
-  // PRD §6.1's diagram also shows a seller-ACCEPT path straight from DISPUTED, but §6.2 only
-  // defines UNDER_REVIEW/RESOLUTION_PROPOSED as the resolution route — both ACCEPT and CONTEST
-  // go through arbitration here so every dispute produces a recorded resolution, not just a
-  // CONTEST. Revisit if a faster ACCEPT→refund path is wanted without a review record.
-  DISPUTED: [STATES.UNDER_REVIEW],
+  // Seller ACCEPT → straight to a proposed refund (FR-07); CONTEST → arbitration (UNDER_REVIEW).
+  DISPUTED: [STATES.UNDER_REVIEW, STATES.RESOLUTION_PROPOSED],
   UNDER_REVIEW: [STATES.RESOLUTION_PROPOSED],
   RESOLUTION_PROPOSED: [STATES.AWAITING_SIGNATURES],
   AWAITING_SIGNATURES: [STATES.RELEASED, STATES.REFUNDED, STATES.SPLIT],

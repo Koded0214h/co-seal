@@ -15,6 +15,41 @@ db.exec('PRAGMA foreign_keys = ON;');
 // and append-only-event patterns carry over unchanged — only the payment-rail-specific
 // columns (escrow scripts, PSBTs, Nostr refs) are new.
 db.exec(`
+-- Identity + RBAC. No passwords: a user *is* a Nostr public key (x-only hex) proven by a signed
+-- challenge. Global role: USER | ARBITRATOR | ADMIN. Per-order roles (BUYER/SELLER/ARBITRATOR)
+-- are derived from the order's *_user_id columns.
+CREATE TABLE IF NOT EXISTS users (
+  id            TEXT PRIMARY KEY,
+  pubkey        TEXT UNIQUE NOT NULL,                  -- Nostr x-only pubkey, 64 hex
+  display_name  TEXT,
+  contact_email TEXT,                                  -- optional, for customer tracking/support
+  role          TEXT NOT NULL DEFAULT 'USER',          -- USER | ARBITRATOR | ADMIN
+  status        TEXT NOT NULL DEFAULT 'ACTIVE',        -- ACTIVE | SUSPENDED
+  btc_pubkey    TEXT,                                  -- arbitrators: compressed secp256k1 key used in escrows
+  created_at    INTEGER NOT NULL,
+  last_login_at INTEGER
+);
+
+-- Single-use login challenges (replay protection).
+CREATE TABLE IF NOT EXISTS auth_challenges (
+  nonce      TEXT PRIMARY KEY,
+  expires_at INTEGER NOT NULL,
+  used_at    INTEGER
+);
+
+-- Opaque bearer sessions; only the SHA-256 of the token is stored.
+CREATE TABLE IF NOT EXISTS sessions (
+  id         TEXT PRIMARY KEY,
+  user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  token_hash TEXT UNIQUE NOT NULL,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  revoked_at INTEGER,
+  ip         TEXT,
+  user_agent TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+
 CREATE TABLE IF NOT EXISTS orders (
   id                   TEXT PRIMARY KEY,
   ref                  TEXT UNIQUE NOT NULL,          -- human ref, e.g. cs-order-893
@@ -27,6 +62,10 @@ CREATE TABLE IF NOT EXISTS orders (
   expected_delivery_at INTEGER,
   dispute_terms        TEXT,
   state                TEXT NOT NULL DEFAULT 'CREATED',
+  seller_user_id       TEXT REFERENCES users(id),     -- authenticated owner of the seller side
+  buyer_user_id        TEXT REFERENCES users(id),
+  arbitrator_user_id   TEXT REFERENCES users(id),     -- assigned at creation; their btc key is in the escrow
+  invited_buyer_nostr  TEXT,                          -- optional: only this identity may join as buyer
   dispatch_reference   TEXT,
   review_window_expires_at INTEGER,
   released_at          INTEGER,
@@ -46,6 +85,7 @@ CREATE TABLE IF NOT EXISTS participants (
   pubkey     TEXT NOT NULL,                           -- Bitcoin pubkey used in the 2-of-3 multisig
   nostr_pubkey TEXT,                                  -- Nostr identity, if different
   payout_address TEXT,                                -- where this party is paid on settlement
+  user_id    TEXT REFERENCES users(id),
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_participants_order ON participants(order_id);
@@ -75,7 +115,10 @@ CREATE TABLE IF NOT EXISTS evidence (
   sha256        TEXT,                                   -- content hash of the original uploaded bytes
   note          TEXT,
   captured_at   INTEGER NOT NULL,                       -- SERVER receive time (trusted)
-  device_captured_at INTEGER                            -- claimed device capture time (UNVERIFIED)
+  device_captured_at INTEGER,                           -- claimed device capture time (UNVERIFIED)
+  mime          TEXT,                                   -- sniffed from magic bytes
+  phash         TEXT,                                   -- perceptual hash (images) for reused-photo detection
+  uploaded_by   TEXT REFERENCES users(id)
 );
 CREATE INDEX IF NOT EXISTS idx_evidence_order ON evidence(order_id);
 
@@ -153,6 +196,19 @@ CREATE TABLE IF NOT EXISTS notifications (
 );
 CREATE INDEX IF NOT EXISTS idx_notifications_order ON notifications(order_id);
 
+-- Post-agreement term changes (FR-01): need the counterparty's explicit acceptance.
+CREATE TABLE IF NOT EXISTS amendments (
+  id          TEXT PRIMARY KEY,
+  order_id    TEXT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+  proposed_by TEXT NOT NULL REFERENCES users(id),
+  changes     TEXT NOT NULL,                           -- JSON of changed fields
+  new_hash    TEXT NOT NULL,                           -- agreement hash if accepted
+  status      TEXT NOT NULL DEFAULT 'PROPOSED',        -- PROPOSED | ACCEPTED | REJECTED | SUPERSEDED
+  created_at  INTEGER NOT NULL,
+  decided_at  INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_amend_order ON amendments(order_id);
+
 -- Nostr event references only — CoSeal stores metadata, never the private message content
 -- itself (PRD §9/FR-09: "store message references ... rather than ... the authoritative owner").
 CREATE TABLE IF NOT EXISTS nostr_events (
@@ -176,6 +232,7 @@ CREATE TABLE IF NOT EXISTS events (
   to_state   TEXT,
   detail     TEXT,
   created_at INTEGER NOT NULL,
+  actor      TEXT,                                       -- who caused it: user:<id>:<ROLE> | system
   prev_hash  TEXT,                                       -- hash of the previous event for this order
   hash       TEXT                                        -- sha256 over this event + prev_hash (tamper-evident chain)
 );

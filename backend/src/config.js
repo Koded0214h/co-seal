@@ -22,7 +22,7 @@ export const config = {
     root,
     data: dataDir,
     db: path.join(dataDir, 'coseal.db'),
-    uploads: path.join(root, 'uploads'),
+    uploads: process.env.UPLOAD_DIR ? path.resolve(process.env.UPLOAD_DIR) : path.join(root, 'uploads'),
   },
 
   // PRD §11: Bitcoin Core RPC + Signet, order-specific P2WSH 2-of-3 multisig escrow.
@@ -33,7 +33,11 @@ export const config = {
     // BITCOIN_LIVE=true switches off simulation: real P2WSH escrows, Esplora funding detection,
     // real PSBT signing + broadcast. Requires ARBITRATOR_PUBKEY.
     live: bool(process.env.BITCOIN_LIVE, false),
+    // Which chain backend to use: 'esplora' (REST indexer) or 'rpc' (Bitcoin Core watch-only wallet).
+    chain: (process.env.BITCOIN_CHAIN || 'esplora').trim(),
+    rpcWallet: process.env.BITCOIN_RPC_WALLET || 'coseal_watch',
     esploraUrl: (process.env.BITCOIN_ESPLORA_URL || 'https://mempool.space/signet/api').replace(/\/$/, ''),
+    settlementDropMinutes: num(process.env.SETTLEMENT_DROP_MINUTES, 30),
     feeRate: num(process.env.BITCOIN_FEE_RATE, 2), // sat/vB
     rpcUrl: (process.env.BITCOIN_RPC_URL || 'http://127.0.0.1:38332').replace(/\/$/, ''),
     rpcUser: process.env.BITCOIN_RPC_USER || '',
@@ -54,11 +58,22 @@ export const config = {
     servicePrivkey: process.env.NOSTR_SERVICE_PRIVKEY || '',
   },
 
-  llm: {
-    baseUrl: (process.env.LLM_BASE_URL || 'https://api.groq.com/openai/v1').replace(/\/$/, ''),
-    apiKey: process.env.LLM_API_KEY || '',
-    model: process.env.LLM_MODEL || 'qwen/qwen3.6-27b',
-  },
+  // AI provider (adapters in src/lib/llm). Default: OpenAI's smallest/cheapest model, gpt-5-nano.
+  // LLM_PROVIDER=anthropic switches to Claude Haiku 5.5. Auto-picks whichever API key is present.
+  llm: (() => {
+    const e = process.env;
+    const provider = (e.LLM_PROVIDER || (e.OPENAI_API_KEY ? 'openai' : e.ANTHROPIC_API_KEY ? 'anthropic' : 'openai')).trim().toLowerCase();
+    const anthropic = provider === 'anthropic';
+    return {
+      provider,
+      apiKey: (anthropic ? e.ANTHROPIC_API_KEY : e.OPENAI_API_KEY) || e.LLM_API_KEY || '',
+      baseUrl: ((anthropic ? e.ANTHROPIC_BASE_URL : e.OPENAI_BASE_URL) || e.LLM_BASE_URL || '').replace(/\/$/, ''),
+      model: e.LLM_MODEL || (anthropic ? 'claude-haiku-5-5' : 'gpt-5-nano'),
+      timeoutMs: num(e.LLM_TIMEOUT_MS, 30_000),
+      reasoningEffort: (e.LLM_REASONING_EFFORT || '').trim(), // OpenAI gpt-5 family; default 'minimal'
+      imageDetail: (e.LLM_IMAGE_DETAIL || 'low').trim(),      // OpenAI vision: low = cheapest fixed cost
+    };
+  })(),
 
   // PRD §6.4: there is deliberately no backend-timer default-release. A buyer who ghosts
   // after delivery escalates into arbitration once the review window lapses; a real
@@ -68,7 +83,19 @@ export const config = {
     reviewWindowSeconds: num(process.env.REVIEW_WINDOW_SECONDS, 0),
   },
 
-  adminToken: process.env.ADMIN_TOKEN || 'change-me-admin-token',
+  auth: {
+    // Nostr x-only pubkeys (hex) that are promoted to ADMIN on login. Bootstrap only.
+    adminPubkeys: (process.env.ADMIN_PUBKEYS || '').split(',').map((k) => k.trim().toLowerCase()).filter(Boolean),
+    sessionTtlHours: num(process.env.SESSION_TTL_HOURS, 24),
+    challengeTtlSeconds: num(process.env.CHALLENGE_TTL_SECONDS, 120),
+    maxClockSkewSeconds: num(process.env.AUTH_MAX_CLOCK_SKEW_SECONDS, 120),
+  },
+  corsOrigins: (process.env.CORS_ORIGINS || '').split(',').map((o) => o.trim()).filter(Boolean),
+  rateLimit: {
+    enabled: bool(process.env.RATE_LIMIT_ENABLED, true),
+    perMinute: num(process.env.RATE_LIMIT_PER_MINUTE, 240),
+    authPerMinute: num(process.env.RATE_LIMIT_AUTH_PER_MINUTE, 20),
+  },
   demoMode: bool(process.env.DEMO_MODE, true),
 };
 
@@ -99,6 +126,8 @@ export function summarizeConfig() {
     esplora: bitcoinLive ? config.bitcoin.esploraUrl : undefined,
     arbitratorPubkeyConfigured: Boolean(config.bitcoin.arbitratorPubkey),
     nostrRelays: config.nostr.relays,
+    chain: bitcoinLive ? config.bitcoin.chain : undefined,
+    llmProvider: config.llm.provider,
     llmModel: config.llm.model,
     llmConfigured: Boolean(config.llm.apiKey),
     reviewWindow: config.escrow.reviewWindowSeconds > 0

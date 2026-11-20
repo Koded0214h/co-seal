@@ -3,16 +3,20 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "CoSeal — non-custodial Bitcoin multisig escrow API with Nostr messaging and AI-assisted dispute evidence",
+  "description": "CoSeal \u2014 non-custodial Bitcoin multisig escrow API with Nostr messaging and AI-assisted dispute evidence",
   "engines": {
     "node": ">=22.5.0"
   },
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
-    "test": "node --test \"test/*.test.js\""
+    "test": "node --test \"test/*.test.js\"",
+    "test:unit": "node --test --test-skip-pattern=\"REAL NODE\" \"test/*.test.js\"",
+    "test:e2e": "node --test test/e2e-bitcoind.test.js",
+    "regtest": "bash scripts/regtest-node.sh"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^1.11.0",
     "bitcoinjs-lib": "^6.1.10",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
@@ -21,6 +25,7 @@
     "jimp": "^1.6.1",
     "multer": "^2.2.0",
     "nostr-tools": "^2.26.1",
+    "openai": "^7.62.0",
     "tiny-secp256k1": "^2.2.5"
   }
 }

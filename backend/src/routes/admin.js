@@ -1,62 +1,78 @@
 import { Router } from 'express';
-import path from 'node:path';
 import { db } from '../db.js';
-import { config } from '../config.js';
+import * as auth from '../lib/auth.js';
 import * as svc from '../services/orderService.js';
-import * as ai from '../lib/ai.js';
+import { ah, bad } from './helpers.js';
 
-const router = Router();
+/** ADMIN-only: customer/user management and platform overview. */
+export const adminRouter = Router();
+adminRouter.use(auth.requireRole('ADMIN'));
 
-// Simple bearer-token guard for the internal arbitration console (FR-08).
-// TODO: PRD §9 asks that "arbitrator access must be restricted to assigned disputes" —
-// this single shared ADMIN_TOKEN (ported from LinkLock) is a hackathon stand-in, not
-// per-arbitrator access control.
-router.use((req, res, next) => {
-  const token = (req.get('authorization') || '').replace(/^Bearer\s+/i, '') || req.query.token;
-  if (token !== config.adminToken) return res.status(401).json({ error: 'Unauthorized' });
-  next();
+adminRouter.get('/users', (req, res) => {
+  const where = [];
+  const args = [];
+  if (req.query.role) { where.push('role = ?'); args.push(String(req.query.role).toUpperCase()); }
+  if (req.query.status) { where.push('status = ?'); args.push(String(req.query.status).toUpperCase()); }
+  if (req.query.q) { where.push('(pubkey LIKE ? OR display_name LIKE ? OR contact_email LIKE ?)'); const q = `%${String(req.query.q)}%`; args.push(q, q, q); }
+  const rows = db.prepare(`SELECT * FROM users ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY created_at DESC LIMIT 500`).all(...args);
+  res.json(rows.map((u) => ({ ...auth.publicUser(u), stats: auth.userStats(u.id) })));
 });
 
-const ah = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
-
-/* All transactions (newest first) for the ops board, with an optional ?state= filter. */
-router.get('/orders', ah(async (req, res) => {
-  const rows = req.query.state
-    ? db.prepare('SELECT * FROM orders WHERE state = ? ORDER BY created_at DESC').all(req.query.state)
-    : db.prepare('SELECT * FROM orders ORDER BY created_at DESC').all();
-  res.json(rows.map((o) => svc.serializeOrder(o)));
-}));
-
-/* The arbitration queue: everything currently frozen or under review. */
-router.get('/review-queue', ah(async (req, res) => {
-  const rows = db.prepare("SELECT * FROM orders WHERE state IN ('DISPUTED','UNDER_REVIEW') ORDER BY updated_at DESC").all();
-  res.json(rows.map((o) => svc.serializeOrder(o)));
-}));
-
-/* Re-run the AI evidence comparison for a case (assist for the arbitrator, FR-08). */
-router.post('/orders/:ref/recompare', ah(async (req, res) => {
-  const order = svc.getOrderByRef(req.params.ref);
-  if (!order) return res.status(404).json({ error: 'Transaction not found' });
-  const sellerEv = db.prepare("SELECT * FROM evidence WHERE order_id=? AND side='SELLER' ORDER BY captured_at DESC LIMIT 1").get(order.id);
-  const buyerEv = db.prepare("SELECT * FROM evidence WHERE order_id=? AND side='BUYER' ORDER BY captured_at DESC LIMIT 1").get(order.id);
-  if (!sellerEv || !buyerEv) return res.status(400).json({ error: 'Need both seller and buyer evidence to compare' });
-  const comparison = await ai.compareEvidence({
-    dispatchFilePath: path.join(config.paths.uploads, sellerEv.stored_file),
-    problemFilePath: path.join(config.paths.uploads, buyerEv.stored_file),
-    itemDescription: order.item_description,
+adminRouter.get('/users/:id', (req, res) => {
+  const user = auth.getUserById(req.params.id);
+  if (!user) return bad(res, 'User not found', 404);
+  res.json({
+    user: auth.publicUser(user), stats: auth.userStats(user.id),
+    orders: svc.listOrdersForUser(user.id).map((o) => svc.summarizeOrder(o, auth.orderRoles(o, user))),
+    sessions: db.prepare('SELECT id, created_at, expires_at, revoked_at, ip, user_agent FROM sessions WHERE user_id = ? ORDER BY created_at DESC LIMIT 20').all(user.id),
   });
-  svc.saveDisputeAiComparison(order.id, comparison);
-  res.json({ comparison, order: svc.serializeOrder(order) });
+});
+
+adminRouter.patch('/users/:id', ah(async (req, res) => {
+  const { role, btcPubkey, status } = req.body || {};
+  if (req.params.id === req.user.id && ((role && role !== 'ADMIN') || status === 'SUSPENDED')) {
+    return bad(res, 'You cannot demote or suspend yourself', 409);
+  }
+  let user = auth.getUserById(req.params.id);
+  if (!user) return bad(res, 'User not found', 404);
+  if (role) user = auth.setUserRole(user.id, String(role).toUpperCase(), { btcPubkey });
+  if (status) user = auth.setUserStatus(user.id, String(status).toUpperCase());
+  res.json({ user: auth.publicUser(user) });
 }));
 
-/* Arbitrator decision: RELEASE | REFUND | SPLIT on a case under review. */
-router.post('/orders/:ref/resolve', ah(async (req, res) => {
-  const order = svc.getOrderByRef(req.params.ref);
-  if (!order) return res.status(404).json({ error: 'Transaction not found' });
-  const decision = String(req.body?.decision || '').toUpperCase();
-  const note = req.body?.note;
-  const result = await svc.resolveByArbitrator(order, { decision, note });
-  res.json(svc.serializeOrder(result.order));
+adminRouter.post('/arbitrators', ah(async (req, res) => {
+  const user = auth.registerArbitrator({ nostrPubkey: req.body?.nostrPubkey, btcPubkey: req.body?.btcPubkey, displayName: req.body?.displayName });
+  res.status(201).json({ user: auth.publicUser(user) });
 }));
 
-export default router;
+adminRouter.get('/orders', (req, res) => {
+  const rows = req.query.state
+    ? db.prepare('SELECT * FROM orders WHERE state = ? ORDER BY created_at DESC LIMIT 500').all(String(req.query.state).toUpperCase())
+    : db.prepare('SELECT * FROM orders ORDER BY created_at DESC LIMIT 500').all();
+  res.json(rows.map((o) => svc.summarizeOrder(o, auth.orderRoles(o, req.user))));
+});
+
+adminRouter.get('/stats', (_req, res) => {
+  const byState = Object.fromEntries(db.prepare('SELECT state, COUNT(*) AS n FROM orders GROUP BY state').all().map((r) => [r.state, r.n]));
+  const vol = db.prepare("SELECT COALESCE(SUM(amount_sats),0) AS v FROM orders WHERE state IN ('RELEASED','REFUNDED','SPLIT')").get().v;
+  const users = db.prepare('SELECT role, COUNT(*) AS n FROM users GROUP BY role').all();
+  res.json({
+    orders: { total: Object.values(byState).reduce((a, b) => a + b, 0), byState },
+    settledVolumeSats: vol,
+    users: Object.fromEntries(users.map((r) => [r.role, r.n])),
+  });
+});
+
+/** ARBITRATOR (or ADMIN): the cases assigned to me. */
+export const arbitratorRouter = Router();
+arbitratorRouter.use(auth.requireRole('ARBITRATOR'));
+
+arbitratorRouter.get('/queue', (req, res) => {
+  const open = "state IN ('DISPUTED','UNDER_REVIEW','RESOLUTION_PROPOSED','AWAITING_SIGNATURES')";
+  const rows = req.user.role === 'ADMIN'
+    ? db.prepare(`SELECT * FROM orders WHERE arbitrator_user_id IS NULL AND ${open} ORDER BY updated_at DESC`).all()
+    : db.prepare(`SELECT * FROM orders WHERE arbitrator_user_id = ? AND ${open} ORDER BY updated_at DESC`).all(req.user.id);
+  res.json(rows.map((o) => svc.summarizeOrder(o, auth.orderRoles(o, req.user))));
+});
+
+export default adminRouter;

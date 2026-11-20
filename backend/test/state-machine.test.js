@@ -16,6 +16,12 @@ test('disputed / under-review orders can never jump to release states or back to
   }
 });
 
+test('seller ACCEPT may go straight from DISPUTED to a proposed resolution; CONTEST goes through arbitration', () => {
+  assert.equal(canTransition('DISPUTED', 'RESOLUTION_PROPOSED'), true);
+  assert.equal(canTransition('DISPUTED', 'UNDER_REVIEW'), true);
+  assert.equal(canTransition('UNDER_REVIEW', 'AWAITING_SIGNATURES'), false, 'arbitration must record a proposal first');
+});
+
 test('no state can skip funding', () => {
   assert.equal(canTransition('CREATED', 'FUNDED'), false);
   assert.equal(canTransition('AWAITING_FUNDING', 'DISPATCHED'), false);

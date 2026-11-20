@@ -4,27 +4,29 @@ import { config, bitcoinLive, reviewWindowMs } from '../config.js';
 import { uid, orderRef } from '../lib/ids.js';
 import { STATES, assertTransition, STATE_LABELS } from '../stateMachine.js';
 import { sendNotification, listNotifications } from '../lib/notify.js';
-import { hashUploadedFile, sniffImageType, removeUpload } from '../lib/upload.js';
+import { hashUploadedFile, sniffFileType, removeUpload } from '../lib/upload.js';
 import * as btc from '../lib/bitcoin.js';
 import * as nostr from '../lib/nostr.js';
+import { currentActor } from '../lib/context.js';
+import { logError } from '../lib/log.js';
 
 /* ─────────────────────────── helpers ─────────────────────────── */
 
 const eventHash = (prev, e) => crypto.createHash('sha256')
-  .update(JSON.stringify([prev || '', e.id, e.order_id, e.type, e.from_state, e.to_state, e.detail, e.created_at]))
+  .update(JSON.stringify([prev || '', e.id, e.order_id, e.type, e.from_state, e.to_state, e.detail, e.created_at, e.actor]))
   .digest('hex');
 
-/** Append-only, hash-chained audit event (FR-11). Each hash commits to the previous one. */
+/** Append-only, hash-chained audit event (FR-11). Each hash commits to the previous one and the actor. */
 export function recordEvent(orderId, type, fromState, toState, detail) {
   const prev = db.prepare('SELECT hash FROM events WHERE order_id = ? ORDER BY rowid DESC LIMIT 1').get(orderId)?.hash || null;
   const e = {
     id: uid('evt'), order_id: orderId, type, from_state: fromState || null, to_state: toState || null,
-    detail: detail ? JSON.stringify(detail) : null, created_at: now(),
+    detail: detail ? JSON.stringify(detail) : null, created_at: now(), actor: currentActor(),
   };
   db.prepare(
-    `INSERT INTO events (id, order_id, type, from_state, to_state, detail, created_at, prev_hash, hash)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(e.id, e.order_id, e.type, e.from_state, e.to_state, e.detail, e.created_at, prev, eventHash(prev, e));
+    `INSERT INTO events (id, order_id, type, from_state, to_state, detail, created_at, actor, prev_hash, hash)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(e.id, e.order_id, e.type, e.from_state, e.to_state, e.detail, e.created_at, e.actor, prev, eventHash(prev, e));
 }
 
 /** Public audit trail + chain verification. `valid:false` pinpoints the first broken link. */
@@ -37,7 +39,7 @@ export function getEventHistory(order) {
     const ok = r.prev_hash === prev && r.hash === eventHash(prev, r);
     if (!ok && valid) { valid = false; brokenAt = r.id; }
     prev = r.hash;
-    return { id: r.id, type: r.type, fromState: r.from_state, toState: r.to_state, detail: parse(r.detail), createdAt: r.created_at, prevHash: r.prev_hash, hash: r.hash };
+    return { id: r.id, type: r.type, fromState: r.from_state, toState: r.to_state, detail: parse(r.detail), actor: r.actor, createdAt: r.created_at, prevHash: r.prev_hash, hash: r.hash };
   });
   return { orderRef: order.ref, valid, brokenAt, headHash: prev, events };
 }
@@ -115,18 +117,35 @@ function getSettlement(orderId, type) {
 
 /* ─────────────────────────── create ─────────────────────────── */
 
+/** Pick the arbitrator for a new order: the requested one, else the least-loaded active arbitrator. */
+export function pickArbitrator(preferredUserId) {
+  if (preferredUserId) {
+    const u = db.prepare("SELECT * FROM users WHERE id = ? AND role = 'ARBITRATOR' AND status = 'ACTIVE' AND btc_pubkey IS NOT NULL").get(preferredUserId);
+    if (!u) throw httpError(400, 'Requested arbitrator is not an active arbitrator');
+    return u;
+  }
+  return db.prepare(
+    `SELECT u.*, (SELECT COUNT(*) FROM orders o WHERE o.arbitrator_user_id = u.id
+                    AND o.state NOT IN ('RELEASED','REFUNDED','SPLIT')) AS load
+       FROM users u WHERE u.role = 'ARBITRATOR' AND u.status = 'ACTIVE' AND u.btc_pubkey IS NOT NULL
+      ORDER BY load ASC, u.created_at ASC LIMIT 1`,
+  ).get() || null;
+}
+
 /**
- * FR-01: seller creates a transaction.
+ * FR-01: seller creates a transaction. `input.sellerUserId` binds the seller side to an
+ * authenticated user; an arbitrator is assigned now because their key is part of the escrow.
  *
- * SIMULATION mode: a fake escrow is minted immediately (frontend demo path).
+ * SIMULATION mode: a fake escrow is minted immediately.
  * LIVE mode: a 2-of-3 escrow needs the buyer's key, so the order waits in CREATED until the
- * buyer joins (`joinAsBuyer`) — unless the seller already supplied `buyerPubkey`.
+ * buyer joins (`joinAsBuyer`) — unless the caller already supplied `buyerPubkey` (service-level only).
  */
 export async function createOrder(input) {
   const id = uid('ord');
   const ref = orderRef();
   const ts = now();
 
+  const arbitrator = pickArbitrator(input.arbitratorUserId);
   if (bitcoinLive) {
     if (!input.sellerPayoutAddress || !btc.isValidAddress(input.sellerPayoutAddress)) {
       throw httpError(400, 'sellerPayoutAddress must be a valid address on the configured network');
@@ -134,34 +153,38 @@ export async function createOrder(input) {
     btc.normalizePubkey(input.sellerPubkey, 'sellerPubkey');
     if (input.buyerPubkey) btc.normalizePubkey(input.buyerPubkey, 'buyerPubkey');
     if (input.buyerPubkey && !input.buyerPayoutAddress) throw httpError(400, 'buyerPayoutAddress is required with buyerPubkey');
+    if (!arbitrator && !config.bitcoin.arbitratorPubkey) throw httpError(503, 'No arbitrator is available to assign to this order');
   }
 
   db.prepare(
     `INSERT INTO orders (
       id, ref, item_description, amount_sats, seller_pubkey, seller_name, buyer_pubkey,
       delivery_conditions, expected_delivery_at, dispute_terms,
+      seller_user_id, arbitrator_user_id, invited_buyer_nostr,
       state, created_at, updated_at
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
   ).run(
     id, ref, input.itemDescription, input.amountSats, input.sellerPubkey, input.sellerName || null,
     input.buyerPubkey || null,
     input.deliveryConditions || null, input.expectedDeliveryAt || null, input.disputeTerms || null,
+    input.sellerUserId || null, arbitrator?.id || null, input.invitedBuyerNostr?.toLowerCase() || null,
     STATES.CREATED, ts, ts,
   );
-  recordEvent(id, 'CREATED', null, STATES.CREATED, { mode: bitcoinLive ? 'LIVE' : 'SIMULATION' });
+  recordEvent(id, 'CREATED', null, STATES.CREATED, { mode: bitcoinLive ? 'LIVE' : 'SIMULATION', arbitratorAssigned: Boolean(arbitrator) });
   recordEvent(id, 'AGREEMENT_ACCEPTED', null, null, { by: 'SELLER', agreementHash: agreementHash(getOrderById(id)) });
 
-  addParticipant(id, 'SELLER', input.sellerPubkey, input.sellerPayoutAddress);
-  if (input.buyerPubkey) addParticipant(id, 'BUYER', input.buyerPubkey, input.buyerPayoutAddress);
+  addParticipant(id, 'SELLER', input.sellerPubkey, input.sellerPayoutAddress, input.sellerUserId);
+  if (input.buyerPubkey) addParticipant(id, 'BUYER', input.buyerPubkey, input.buyerPayoutAddress, input.buyerUserId);
 
   if (!bitcoinLive || input.buyerPubkey) attachEscrow(getOrderById(id), ref);
   return getOrderById(id);
 }
 
-function addParticipant(orderId, role, pubkey, payoutAddress) {
+function addParticipant(orderId, role, pubkey, payoutAddress, userId) {
+  const nostrPk = userId ? db.prepare('SELECT pubkey FROM users WHERE id = ?').get(userId)?.pubkey : null;
   db.prepare(
-    `INSERT INTO participants (id, order_id, role, pubkey, payout_address, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
-  ).run(uid('ptc'), orderId, role, pubkey, payoutAddress || null, now());
+    `INSERT INTO participants (id, order_id, role, pubkey, nostr_pubkey, payout_address, user_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(uid('ptc'), orderId, role, pubkey, nostrPk || null, payoutAddress || null, userId || null, now());
 }
 
 function httpError(status, message) {
@@ -170,12 +193,19 @@ function httpError(status, message) {
   return e;
 }
 
+/** The arbitrator's escrow key for this order: the assigned arbitrator's, else the configured fallback. */
+function arbitratorKeyFor(order) {
+  if (order.arbitrator_user_id) return db.prepare('SELECT btc_pubkey FROM users WHERE id = ?').get(order.arbitrator_user_id)?.btc_pubkey || null;
+  return config.bitcoin.arbitratorPubkey || null;
+}
+
 /** Create the escrow row and move CREATED → AWAITING_FUNDING. */
 function attachEscrow(order, ref) {
   const sellerPubkey = order.seller_pubkey;
   const buyerPubkey = order.buyer_pubkey;
+  const arbitratorPubkey = arbitratorKeyFor(order);
   const escrow = bitcoinLive
-    ? btc.createEscrow({ buyerPubkey, sellerPubkey, arbitratorPubkey: config.bitcoin.arbitratorPubkey })
+    ? btc.createEscrow({ buyerPubkey, sellerPubkey, arbitratorPubkey })
     : simulatedEscrow(ref);
 
   if (bitcoinLive && db.prepare('SELECT 1 FROM escrows WHERE address = ?').get(escrow.address)) {
@@ -188,16 +218,26 @@ function attachEscrow(order, ref) {
      VALUES (?,?,?,?,?,?,?,?,?,?)`,
   ).run(
     uid('esc'), order.id, config.bitcoin.network, escrow.redeemScript || null, escrow.witnessScript || null,
-    escrow.address, buyerPubkey || null, sellerPubkey, config.bitcoin.arbitratorPubkey || null, now(),
+    escrow.address, buyerPubkey || null, sellerPubkey, arbitratorPubkey || null, now(),
   );
+  // Start watching the address on the chain backend; a failure here is retried lazily on first poll.
+  if (bitcoinLive) Promise.resolve(btc.getChain().watch?.(escrow.address)).catch((e) => logError('[chain] watch failed:', e));
   recordEvent(order.id, 'ESCROW_GENERATED', null, null, { address: escrow.address, witnessScript: escrow.witnessScript || null });
   setState(order, STATES.AWAITING_FUNDING, { escrowAddress: escrow.address });
 }
 
-/** Buyer opens the link and joins: supplies their key + payout address, which completes the escrow. */
-export function joinAsBuyer(order, { buyerPubkey, buyerPayoutAddress, agreementHash: accepted }) {
-  if (order.state !== STATES.CREATED || order.buyer_pubkey) {
-    throw httpError(409, 'This transaction already has a buyer');
+/** Buyer opens the link and joins: supplies their escrow key + payout address, which completes the escrow. */
+export function joinAsBuyer(order, { buyerPubkey, buyerPayoutAddress, agreementHash: accepted, userId }) {
+  // Live: the buyer's key is needed to build the escrow, so joining happens in CREATED.
+  // Simulation: a placeholder escrow already exists, so the buyer can still join while awaiting funding.
+  const joinable = bitcoinLive
+    ? order.state === STATES.CREATED && !order.buyer_pubkey
+    : [STATES.CREATED, STATES.AWAITING_FUNDING].includes(order.state) && !order.buyer_user_id;
+  if (!joinable || order.buyer_user_id) throw httpError(409, 'This transaction already has a buyer');
+  if (userId && userId === order.seller_user_id) throw httpError(403, 'The seller cannot be the buyer on their own transaction');
+  if (userId && order.invited_buyer_nostr) {
+    const me = db.prepare('SELECT pubkey FROM users WHERE id = ?').get(userId)?.pubkey;
+    if (me !== order.invited_buyer_nostr) throw httpError(403, 'This transaction is reserved for a specific buyer');
   }
   // The buyer must accept exactly the terms the seller committed to.
   const expected = agreementHash(order);
@@ -211,12 +251,13 @@ export function joinAsBuyer(order, { buyerPubkey, buyerPayoutAddress, agreementH
   } else if (!buyerPubkey) {
     throw httpError(400, 'buyerPubkey is required');
   }
-  db.prepare('UPDATE orders SET buyer_pubkey = ?, updated_at = ? WHERE id = ?').run(buyerPubkey.toLowerCase?.() ?? buyerPubkey, now(), order.id);
-  addParticipant(order.id, 'BUYER', buyerPubkey, buyerPayoutAddress);
+  const key = buyerPubkey.toLowerCase?.() ?? buyerPubkey;
+  db.prepare('UPDATE orders SET buyer_pubkey = ?, buyer_user_id = ?, updated_at = ? WHERE id = ?').run(key, userId || null, now(), order.id);
+  addParticipant(order.id, 'BUYER', key, buyerPayoutAddress, userId);
   const fresh = getOrderById(order.id);
-  recordEvent(order.id, 'BUYER_JOINED', null, null, { buyerPubkey });
+  recordEvent(order.id, 'BUYER_JOINED', null, null, { buyerPubkey: key });
   recordEvent(order.id, 'AGREEMENT_ACCEPTED', null, null, { by: 'BUYER', agreementHash: expected });
-  attachEscrow(fresh, fresh.ref);
+  if (!getEscrowByOrderId(order.id)) attachEscrow(fresh, fresh.ref);
   return getOrderById(order.id);
 }
 
@@ -251,13 +292,14 @@ export async function checkFundingStatus(order) {
     const status = await btc.getEscrowFundingStatus(escrow.address, { expectedSats: order.amount_sats });
     if (!status) return { order, matched: false };
     observeFunding(order, status);
-    if (!status.sufficient || status.confirmations < config.bitcoin.minConfirmations) return { order, matched: false, observed: status };
-    hit = status;
+    if (!status.sufficient) return { order, matched: false, observed: status };
+    hit = { ...status, amountSats: status.confirmedSats };
   } else {
     hit = { txid: `sim-${order.id.slice(-10)}`, vout: 0, amountSats: order.amount_sats, confirmations: config.bitcoin.minConfirmations };
   }
 
   confirmFunding(order, hit);
+  db.prepare("UPDATE amendments SET status = 'SUPERSEDED', decided_at = ? WHERE order_id = ? AND status = 'PROPOSED'").run(now(), order.id);
   setState(order, STATES.FUNDED, { txid: hit.txid, vout: hit.vout, amountSats: hit.amountSats, confirmations: hit.confirmations });
   sendNotification(order.id, 'SELLER', 'ESCROW_FUNDED',
     `Escrow funded for ${order.ref} (${hit.amountSats} sats, tx ${hit.txid}). Safe to dispatch "${order.item_description}".`);
@@ -355,6 +397,7 @@ export function reportDelivered(order) {
  * releasing funds out from under an open dispute.
  */
 export function signerPolicy(type, trigger) {
+  if (trigger === 'SELLER_ACCEPT') return { allowed: ['BUYER', 'SELLER'], mustInclude: [] }; // seller conceded: refund
   if (trigger === 'BUYER_CONFIRM') return { allowed: ['BUYER', 'SELLER'], mustInclude: [] };
   if (type === 'RELEASE') return { allowed: ['SELLER', 'ARBITRATOR'], mustInclude: [] };
   if (type === 'REFUND') return { allowed: ['BUYER', 'ARBITRATOR'], mustInclude: [] };
@@ -362,62 +405,58 @@ export function signerPolicy(type, trigger) {
 }
 
 /**
- * Propose a settlement (RELEASE/REFUND/SPLIT): builds the PSBT and moves the order to
- * AWAITING_SIGNATURES. Idempotent per order+type via the `{orderId}-{TYPE}` key.
+ * Propose a settlement (RELEASE/REFUND/SPLIT): builds the PSBT spending EVERY confirmed escrow
+ * output (nothing is stranded) and moves the order to AWAITING_SIGNATURES. Idempotent per
+ * order+type via the `{orderId}-{TYPE}` key. Nothing changes state until the PSBT exists, so a
+ * failure (chain unreachable, dust split, …) leaves the order retryable.
  */
-async function proposeSettlement(order, { type, amountSats, trigger }) {
+async function proposeSettlement(order, { type, amountSats, trigger, sellerShareBps }) {
   const key = `${order.id}-${type}`;
   const policy = signerPolicy(type, trigger);
 
   const { settlement } = await recordSettlement(order.id, type, amountSats, key, async () => {
     if (!bitcoinLive) {
-      return { status: 'AWAITING_SIGNATURES', psbt: `sim-psbt-${type}-${order.id.slice(-8)}`, detail: { simulated: true, trigger, policy } };
+      return { status: 'AWAITING_SIGNATURES', psbt: `sim-psbt-${type}-${order.id.slice(-8)}`, detail: { simulated: true, trigger, policy, sellerShareBps: sellerShareBps ?? null } };
     }
     const escrow = getEscrowByOrderId(order.id);
-    const funding = getFundingTx(order.id);
-    if (!funding) throw httpError(409, 'No confirmed funding output to spend');
-    const utxo = { txid: funding.txid, vout: funding.vout, amountSats: funding.amount_sats };
-    await assertUtxoUnspent(escrow.address, utxo);
+    const utxos = await btc.getSpendableUtxos(escrow.address);
+    const total = utxos.reduce((n, u) => n + u.amountSats, 0);
+    if (total < order.amount_sats) throw httpError(409, 'The escrow no longer holds the agreed amount on-chain (reorg or already spent)');
 
-    const outputs = buildOutputsFor(order, type, utxo.amountSats);
-    const built = btc.buildSettlementPsbt({ escrow, utxo, outputs });
-    return { status: 'AWAITING_SIGNATURES', psbt: built.base64, detail: { trigger, policy, outputs, feeSats: built.feeSats } };
+    const outputs = buildOutputsFor(order, type, total, utxos.length, sellerShareBps);
+    const built = btc.buildSettlementPsbt({ escrow, utxos, outputs });
+    return { status: 'AWAITING_SIGNATURES', psbt: built.base64, detail: { trigger, policy, outputs, feeSats: built.feeSats, inputCount: utxos.length, sellerShareBps: sellerShareBps ?? null } };
   });
 
+  order.state = getOrderById(order.id).state; // a concurrent duplicate request may already have advanced it
+  if ([STATES.DISPUTED, STATES.UNDER_REVIEW].includes(order.state)) setState(order, STATES.RESOLUTION_PROPOSED, { type, trigger });
   if ([STATES.REVIEW_PENDING, STATES.RESOLUTION_PROPOSED].includes(order.state)) {
     setState(order, STATES.AWAITING_SIGNATURES, { type, trigger });
   }
   recordEvent(order.id, 'PSBT_CREATED', null, null, { type, trigger, settlementId: settlement.id });
-  sendNotification(order.id, 'SELLER', 'SETTLEMENT_PROPOSED',
-    `${order.ref}: a ${type.toLowerCase()} settlement is awaiting signatures (trigger: ${trigger}).`);
-  sendNotification(order.id, 'BUYER', 'SETTLEMENT_PROPOSED',
-    `${order.ref}: a ${type.toLowerCase()} settlement is awaiting signatures (trigger: ${trigger}).`);
+  for (const aud of ['SELLER', 'BUYER']) {
+    sendNotification(order.id, aud, 'SETTLEMENT_PROPOSED',
+      `${order.ref}: a ${type.toLowerCase()} settlement is awaiting signatures (trigger: ${trigger}).`);
+  }
   return { order: getOrderById(order.id), settlement };
 }
 
-async function assertUtxoUnspent(address, utxo) {
-  const live = await btc.getChain().getUtxos(address);
-  if (!live.some((u) => u.txid === utxo.txid && u.vout === utxo.vout)) {
-    throw httpError(409, 'The funding output is no longer on-chain (reorg or already spent)');
-  }
-}
-
-/** Settlement outputs for the UTXO value minus the miner fee. Fee is borne by the receiving side(s). */
-function buildOutputsFor(order, type, utxoSats) {
+/** Settlement outputs for the escrow value minus the miner fee. The fee is borne by the receiving side(s). */
+function buildOutputsFor(order, type, totalSats, inputCount, sellerShareBps) {
   const payout = (role) => {
     const p = listParticipants(order.id).find((x) => x.role === role);
     if (!p?.payout_address) throw httpError(409, `${role.toLowerCase()} payout address is missing`);
     return p.payout_address;
   };
-  if (type === 'RELEASE') {
-    return [{ address: payout('SELLER'), amountSats: utxoSats - btc.estimateFeeSats(1) }];
-  }
-  if (type === 'REFUND') {
-    return [{ address: payout('BUYER'), amountSats: utxoSats - btc.estimateFeeSats(1) }];
-  }
-  const net = utxoSats - btc.estimateFeeSats(2);
-  const seller = Math.floor(net / 2);
-  return [{ address: payout('SELLER'), amountSats: seller }, { address: payout('BUYER'), amountSats: net - seller }];
+  if (type === 'RELEASE') return [{ address: payout('SELLER'), amountSats: totalSats - btc.estimateFeeSats(1, undefined, inputCount) }];
+  if (type === 'REFUND') return [{ address: payout('BUYER'), amountSats: totalSats - btc.estimateFeeSats(1, undefined, inputCount) }];
+  const bps = sellerShareBps ?? 5000;
+  if (!Number.isInteger(bps) || bps < 1 || bps > 9999) throw httpError(400, 'sellerShareBps must be an integer between 1 and 9999');
+  const net = totalSats - btc.estimateFeeSats(2, undefined, inputCount);
+  const seller = Math.floor((net * bps) / 10000);
+  const buyer = net - seller;
+  if (seller < 546 || buyer < 546) throw httpError(400, 'That split leaves one side below the dust limit; use RELEASE or REFUND instead');
+  return [{ address: payout('SELLER'), amountSats: seller }, { address: payout('BUYER'), amountSats: buyer }];
 }
 
 /* ─────────────── buyer confirm / dispute ─────────────── */
@@ -439,36 +478,51 @@ export function openDispute(order, { category, reason }) {
   return getDisputeByOrder(order.id);
 }
 
-/** Seller responds to a dispute. Both ACCEPT and CONTEST escalate to arbitration (see stateMachine.js note). */
-export function sellerRespondToDispute(order, { response }) {
+/**
+ * FR-07: the seller responds to a dispute.
+ *   ACCEPT  → the seller concedes: a REFUND is proposed immediately, to be co-signed by buyer + seller.
+ *   CONTEST → escalates to human arbitration.
+ * Neither response moves Bitcoin by itself; funds only move when the PSBT is signed.
+ */
+export async function sellerRespondToDispute(order, { response }) {
   const dispute = getDisputeByOrder(order.id);
-  if (!dispute || dispute.state === 'RESOLVED') {
-    const e = new Error('No open dispute to respond to'); e.status = 409; throw e;
+  if (!dispute || dispute.state === 'RESOLVED' || order.state !== STATES.DISPUTED) {
+    throw httpError(409, 'No open dispute to respond to');
+  }
+  if (response === 'ACCEPT') {
+    db.prepare('UPDATE disputes SET seller_response = ?, updated_at = ? WHERE id = ?').run('ACCEPT', now(), dispute.id);
+    const result = await proposeSettlement(order, { type: 'REFUND', amountSats: order.amount_sats, trigger: 'SELLER_ACCEPT' });
+    markDisputeResolved(order.id, 'REFUND', 'Seller accepted the buyer claim');
+    sendNotification(order.id, 'BUYER', 'SELLER_ACCEPTED', `${order.ref}: the seller accepted your claim. A refund is awaiting signatures.`);
+    return { order: result.order, dispute: getDisputeByOrder(order.id), settlement: result.settlement };
   }
   db.prepare('UPDATE disputes SET seller_response = ?, state = ?, updated_at = ? WHERE id = ?')
-    .run(response, 'UNDER_REVIEW', now(), dispute.id);
-  setState(order, STATES.UNDER_REVIEW, { sellerResponse: response });
+    .run('CONTEST', 'UNDER_REVIEW', now(), dispute.id);
+  setState(order, STATES.UNDER_REVIEW, { sellerResponse: 'CONTEST' });
   sendNotification(order.id, 'BUYER', 'UNDER_REVIEW',
-    `${order.ref}: the seller responded (${response}). An arbitrator will review both sides' evidence.`);
+    `${order.ref}: the seller contested. An arbitrator will review both sides' evidence.`);
   return { order: getOrderById(order.id), dispute: getDisputeByOrder(order.id) };
 }
 
 /* ─────────────── arbitration (UNDER_REVIEW → RESOLUTION_PROPOSED → AWAITING_SIGNATURES) ─────────────── */
 
-/** FR-08: arbitrator proposes RELEASE | REFUND | SPLIT. Advisory AI findings inform this but never decide it. */
-export async function resolveByArbitrator(order, { decision, note }) {
-  if (order.state !== STATES.UNDER_REVIEW) {
-    const e = new Error(`${order.ref} is not under review`); e.status = 409; throw e;
+/**
+ * FR-08: arbitrator proposes RELEASE | REFUND | SPLIT. For SPLIT, `sellerShareBps` (1–9999) sets the
+ * seller's share in basis points (default 50/50). AI findings inform this but never decide it.
+ */
+export async function resolveByArbitrator(order, { decision, note, sellerShareBps }) {
+  if (order.state !== STATES.UNDER_REVIEW) throw httpError(409, `${order.ref} is not under review`);
+  if (!['RELEASE', 'REFUND', 'SPLIT'].includes(decision)) throw httpError(400, 'decision must be RELEASE | REFUND | SPLIT');
+  if (decision === 'SPLIT' && sellerShareBps != null && (!Number.isInteger(sellerShareBps) || sellerShareBps < 1 || sellerShareBps > 9999)) {
+    throw httpError(400, 'sellerShareBps must be an integer between 1 and 9999');
   }
-  setState(order, STATES.RESOLUTION_PROPOSED, { decision, note });
+  const result = await proposeSettlement(order, {
+    type: decision, amountSats: order.amount_sats, trigger: 'ARBITRATOR',
+    sellerShareBps: decision === 'SPLIT' ? (sellerShareBps ?? 5000) : undefined,
+  });
   markDisputeResolved(order.id, decision, note);
-
-  const amount = order.amount_sats;
-  const updated = getOrderById(order.id);
-  if (decision === 'RELEASE') return proposeSettlement(updated, { type: 'RELEASE', amountSats: amount, trigger: 'ARBITRATOR' });
-  if (decision === 'REFUND') return proposeSettlement(updated, { type: 'REFUND', amountSats: amount, trigger: 'ARBITRATOR' });
-  if (decision === 'SPLIT') return proposeSettlement(updated, { type: 'SPLIT', amountSats: amount, trigger: 'ARBITRATOR' });
-  const e = new Error('decision must be RELEASE | REFUND | SPLIT'); e.status = 400; throw e;
+  recordEvent(order.id, 'ARBITRATOR_DECISION', null, null, { decision, note: note || null, sellerShareBps: sellerShareBps ?? null });
+  return result;
 }
 
 /* ─────────────── PSBT signing → broadcast (AWAITING_SIGNATURES → terminal) ─────────────── */
@@ -493,7 +547,7 @@ function policySatisfied(policy, roles) {
  *
  * SIMULATION mode keeps the old `{signerPubkey, signature}` shape so the demo UI still works.
  */
-export async function signSettlement(order, { type, signerPubkey, signature, psbt }) {
+export async function signSettlement(order, { type, signerPubkey, signature, psbt, actorRoles }) {
   const settlement = getSettlement(order.id, type);
   if (!settlement || ['BROADCASTING', 'BROADCAST'].includes(settlement.status) || settlement.status === 'FAILED') {
     throw httpError(409, 'No pending settlement of this type to sign');
@@ -514,6 +568,12 @@ export async function signSettlement(order, { type, signerPubkey, signature, psb
   }
 
   const known = parse(settlement.signatures) || [];
+  // The submitting user may only contribute signatures made by their OWN role's key — an
+  // authenticated buyer cannot push in a PSBT signed by the arbitrator's key, and vice versa.
+  if (actorRoles) {
+    const foreign = merged.signers.some((pk, i) => !known.some((k) => k.pubkey === pk) && !actorRoles.has(roles[i]));
+    if (foreign) throw httpError(403, 'You can only submit signatures made with your own key');
+  }
   const signatures = merged.signers.map((pk, i) => {
     const prev = known.find((s) => s.pubkey === pk);
     return prev || { pubkey: pk, role: roles[i], signedAt: now() };
@@ -534,7 +594,7 @@ export async function signSettlement(order, { type, signerPubkey, signature, psb
   }
   let result;
   try {
-    result = await btc.broadcastSettlement({ psbt: merged.base64 });
+    result = await btc.broadcastSettlement({ psbt: merged.base64, preferKey: escrow.arbitrator_pubkey });
   } catch (err) {
     db.prepare("UPDATE settlements SET status = 'AWAITING_SIGNATURES' WHERE id = ?").run(settlement.id);
     recordEvent(order.id, 'BROADCAST_FAILED', null, null, { type, error: err.message });
@@ -588,27 +648,33 @@ function finalizeSettlement(order, type, txid) {
  * write is idempotent so overlapping/duplicate sweeps are harmless.
  */
 export async function runChainSweep() {
-  if (!bitcoinLive) return { funded: [], confirmed: [], lost: [] };
-  const out = { funded: [], confirmed: [], lost: [] };
+  if (!bitcoinLive) return { funded: [], confirmed: [], lost: [], dropped: [], orphans: [] };
+  const out = { funded: [], confirmed: [], lost: [], dropped: [], orphans: [] };
 
   for (const order of db.prepare("SELECT * FROM orders WHERE state = 'AWAITING_FUNDING'").all()) {
     try {
       const r = await checkFundingStatus(order);
       if (r.matched) out.funded.push(order.ref);
-    } catch (err) { console.error(`[chain] funding check ${order.ref}: ${err.message}`); }
+    } catch (err) { logError(`[chain] funding check ${order.ref}:`, err); }
   }
 
   for (const t of db.prepare("SELECT * FROM transactions WHERE type = 'SETTLEMENT' AND status = 'PENDING'").all()) {
     try {
       const st = await btc.getTransactionStatus(t.txid);
+      const detail = parse(t.detail) || {};
       if (st.confirmed && st.confirmations >= config.bitcoin.minConfirmations) {
         db.prepare("UPDATE transactions SET status = 'CONFIRMED', confirmations = ? WHERE id = ?").run(st.confirmations, t.id);
         recordEvent(t.order_id, 'SETTLEMENT_CONFIRMED', null, null, { txid: t.txid, confirmations: st.confirmations });
         out.confirmed.push(t.txid);
+      } else if (!st.found && !detail.notFoundFlagged && now() - t.occurred_at > config.bitcoin.settlementDropMinutes * 60_000) {
+        // Broadcast accepted but the tx vanished (evicted / replaced / reorged out): flag for humans.
+        db.prepare('UPDATE transactions SET detail = ? WHERE id = ?').run(JSON.stringify({ ...detail, notFoundFlagged: true }), t.id);
+        recordEvent(t.order_id, 'SETTLEMENT_NOT_FOUND', null, null, { txid: t.txid });
+        out.dropped.push(t.txid);
       } else if (st.confirmations !== t.confirmations) {
         db.prepare('UPDATE transactions SET confirmations = ? WHERE id = ?').run(st.confirmations, t.id);
       }
-    } catch (err) { console.error(`[chain] settlement status ${t.txid}: ${err.message}`); }
+    } catch (err) { logError(`[chain] settlement status ${t.txid}:`, err); }
   }
 
   const live = ['FUNDED', 'DISPATCHED', 'IN_TRANSIT', 'DELIVERED', 'REVIEW_PENDING', 'DISPUTED', 'UNDER_REVIEW', 'RESOLUTION_PROPOSED', 'AWAITING_SIGNATURES'];
@@ -619,8 +685,8 @@ export async function runChainSweep() {
       if (!funding || !escrow) continue;
       const hasSettlement = db.prepare("SELECT 1 FROM settlements WHERE order_id = ? AND status IN ('BROADCASTING','BROADCAST')").get(order.id);
       if (hasSettlement) continue;
-      const utxos = await btc.getChain().getUtxos(escrow.address);
-      const present = utxos.some((u) => u.txid === funding.txid && u.vout === funding.vout);
+      const status = await btc.getEscrowFundingStatus(escrow.address, { expectedSats: order.amount_sats });
+      const present = Boolean(status?.sufficient);
       const last = db.prepare("SELECT type FROM events WHERE order_id = ? AND type IN ('FUNDING_LOST','FUNDING_RESTORED') ORDER BY created_at DESC, rowid DESC LIMIT 1").get(order.id);
       if (!present && last?.type !== 'FUNDING_LOST') {
         recordEvent(order.id, 'FUNDING_LOST', null, null, { txid: funding.txid });
@@ -629,7 +695,23 @@ export async function runChainSweep() {
       } else if (present && last?.type === 'FUNDING_LOST') {
         recordEvent(order.id, 'FUNDING_RESTORED', null, null, { txid: funding.txid });
       }
-    } catch (err) { console.error(`[chain] funding presence ${order.ref}: ${err.message}`); }
+    } catch (err) { logError(`[chain] funding presence ${order.ref}:`, err); }
+  }
+
+  // Deposits that land after a settlement was confirmed would otherwise sit unnoticed.
+  const recent = now() - 7 * 24 * 3600_000;
+  for (const order of db.prepare("SELECT * FROM orders WHERE state IN ('RELEASED','REFUNDED','SPLIT') AND updated_at > ?").all(recent)) {
+    try {
+      const confirmed = db.prepare("SELECT 1 FROM transactions WHERE order_id = ? AND type = 'SETTLEMENT' AND status = 'CONFIRMED'").get(order.id);
+      const escrow = getEscrowByOrderId(order.id);
+      if (!confirmed || !escrow) continue;
+      for (const u of await btc.getChain().getUtxos(escrow.address)) {
+        const seen = db.prepare("SELECT 1 FROM events WHERE order_id = ? AND type = 'ORPHAN_DEPOSIT' AND detail LIKE ?").get(order.id, `%${u.txid}%`);
+        if (seen) continue;
+        recordEvent(order.id, 'ORPHAN_DEPOSIT', null, null, { txid: u.txid, vout: u.vout, amountSats: u.value });
+        out.orphans.push(u.txid);
+      }
+    } catch (err) { logError(`[chain] orphan check ${order.ref}:`, err); }
   }
   return out;
 }
@@ -678,24 +760,31 @@ export function saveDisputeAiComparison(orderId, comparison) {
     .run(JSON.stringify(comparison), now(), d.id);
 }
 
-export function addEvidence({ orderId, side, storedFile, category, note, mediaType = 'image', deviceCapturedAt }) {
+export function addEvidence({ orderId, side, storedFile, category, note, deviceCapturedAt, uploadedBy }) {
   const id = uid('ev');
-  const sniffed = sniffImageType(storedFile);
+  const sniffed = sniffFileType(storedFile);
   if (!sniffed) {
     removeUpload(storedFile);
-    throw httpError(415, 'File content is not a valid jpeg/png/webp/gif image');
+    throw httpError(415, 'File content is not a valid jpeg/png/webp/gif image or PDF');
   }
+  const mediaType = sniffed === 'application/pdf' ? 'document' : 'image';
   const sha256 = hashUploadedFile(storedFile);
   const device = Number.isFinite(Number(deviceCapturedAt)) && Number(deviceCapturedAt) > 0 ? Number(deviceCapturedAt) : null;
   db.prepare(
-    `INSERT INTO evidence (id, order_id, side, category, media_type, stored_file, sha256, note, captured_at, device_captured_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?)`,
-  ).run(id, orderId, side, category || null, mediaType, storedFile, sha256, note || null, now(), device);
+    `INSERT INTO evidence (id, order_id, side, category, media_type, stored_file, sha256, note, captured_at, device_captured_at, mime, uploaded_by)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+  ).run(id, orderId, side, category || null, mediaType, storedFile, sha256, note || null, now(), device, sniffed, uploadedBy || null);
   recordEvent(orderId, 'EVIDENCE_SUBMITTED', null, null, { evidenceId: id, side, category: category || null, sha256, contentType: sniffed });
   return db.prepare('SELECT * FROM evidence WHERE id = ?').get(id);
 }
 
 /** FR-10/§9: recompute the hash from the stored original bytes and compare with the recorded one. */
+export function getEvidence(orderId, evidenceId) {
+  const ev = db.prepare('SELECT * FROM evidence WHERE id = ? AND order_id = ?').get(evidenceId, orderId);
+  if (!ev) throw httpError(404, 'Evidence not found');
+  return ev;
+}
+
 export function verifyEvidence(orderId, evidenceId) {
   const ev = db.prepare('SELECT * FROM evidence WHERE id = ? AND order_id = ?').get(evidenceId, orderId);
   if (!ev) throw httpError(404, 'Evidence not found');
@@ -713,7 +802,10 @@ export function listEvidence(orderId) {
   return db.prepare('SELECT * FROM evidence WHERE order_id = ? ORDER BY captured_at ASC').all(orderId);
 }
 export function latestSellerEvidence(orderId) {
-  return db.prepare("SELECT * FROM evidence WHERE order_id = ? AND side = 'SELLER' ORDER BY captured_at DESC LIMIT 1").get(orderId);
+  return db.prepare("SELECT * FROM evidence WHERE order_id = ? AND side = 'SELLER' AND media_type = 'image' ORDER BY captured_at DESC, rowid DESC LIMIT 1").get(orderId);
+}
+export function latestBuyerEvidence(orderId) {
+  return db.prepare("SELECT * FROM evidence WHERE order_id = ? AND side = 'BUYER' AND media_type = 'image' ORDER BY captured_at DESC, rowid DESC LIMIT 1").get(orderId);
 }
 
 export function addAssessment({ orderId, evidenceId, assessment }) {
@@ -735,12 +827,14 @@ function parse(json) {
   try { return JSON.parse(json); } catch { return null; }
 }
 
-export function serializeOrder(order) {
+export function serializeOrder(order, viewer) {
+  // viewer: Set of per-order roles. undefined => trusted internal caller (full view).
+  if (viewer && viewer.size === 0) return serializePublic(order);
   const escrow = getEscrowByOrderId(order.id);
   const participants = listParticipants(order.id).map((p) => ({ role: p.role, pubkey: p.pubkey, nostrPubkey: p.nostr_pubkey, payoutAddress: p.payout_address }));
   const evidence = listEvidence(order.id).map((e) => ({
     id: e.id, side: e.side, category: e.category, mediaType: e.media_type,
-    url: `/uploads/${e.stored_file}`, sha256: e.sha256, note: e.note,
+    url: `/api/orders/${order.ref}/evidence/${e.id}/file`, mime: e.mime, sha256: e.sha256, note: e.note,
     capturedAt: e.captured_at, // server-received time (trusted)
     deviceCapturedAt: e.device_captured_at, deviceCapturedAtVerified: false, // claimed by the uploader, unverified
   }));
@@ -759,7 +853,9 @@ export function serializeOrder(order) {
       };
     });
   const dispute = getDisputeByOrder(order.id);
-  const notifications = listNotifications(order.id).map((n) => ({ id: n.id, audience: n.audience, kind: n.kind, body: n.body, createdAt: n.created_at }));
+  const notifications = listNotifications(order.id)
+    .filter((n) => !viewer || viewer.has('ADMIN') || viewer.has(n.audience))
+    .map((n) => ({ id: n.id, audience: n.audience, kind: n.kind, body: n.body, createdAt: n.created_at }));
 
   return {
     id: order.id,
@@ -787,6 +883,9 @@ export function serializeOrder(order) {
     agreementHash: agreementHash(order),
     conversationTag: nostr.conversationTag(order.ref),
     nostrEvents: nostr.listEventReferences(order.id),
+    amendments: listAmendments(order.id),
+    roles: viewer ? [...viewer] : undefined,
+    arbitratorAssigned: Boolean(order.arbitrator_user_id),
     evidence,
     assessments,
     settlements,
@@ -819,4 +918,120 @@ export function addNostrRef(order, ref) {
 
 export function listNostrRefs(order) {
   return nostr.listEventReferences(order.id);
+}
+
+/* ─────────────── agreement changes (FR-01) ─────────────── */
+
+const EDITABLE = {
+  itemDescription: 'item_description', amountSats: 'amount_sats', deliveryConditions: 'delivery_conditions',
+  expectedDeliveryAt: 'expected_delivery_at', disputeTerms: 'dispute_terms',
+};
+
+function validateChanges(changes) {
+  const clean = {};
+  for (const [k, v] of Object.entries(changes || {})) {
+    if (!(k in EDITABLE)) throw httpError(400, `Field "${k}" cannot be changed (allowed: ${Object.keys(EDITABLE).join(', ')})`);
+    if (k === 'amountSats') {
+      if (!Number.isInteger(v) || v <= 0) throw httpError(400, 'amountSats must be a positive integer');
+    } else if (k === 'expectedDeliveryAt') {
+      if (v != null && !Number.isFinite(Number(v))) throw httpError(400, 'expectedDeliveryAt must be a timestamp');
+    } else if (k === 'itemDescription' && String(v).trim().length < 2) {
+      throw httpError(400, 'itemDescription is required');
+    }
+    clean[k] = typeof v === 'string' ? v.trim() : v;
+  }
+  if (!Object.keys(clean).length) throw httpError(400, 'No changes supplied');
+  return clean;
+}
+
+const withChanges = (order, changes) => {
+  const next = { ...order };
+  for (const [k, col] of Object.entries(EDITABLE)) if (k in changes) next[col] = changes[k];
+  return next;
+};
+
+const hasFundingObserved = (orderId) => Boolean(db.prepare("SELECT 1 FROM transactions WHERE order_id = ? AND type = 'FUNDING'").get(orderId));
+
+/** Before a buyer joins nothing is agreed yet, so the seller may simply edit the terms. */
+export function editTerms(order, changes) {
+  if (order.state !== STATES.CREATED || order.buyer_pubkey) throw httpError(409, 'Terms can only be edited before a buyer joins; propose an amendment instead');
+  const clean = validateChanges(changes);
+  const before = agreementHash(order);
+  for (const [k, v] of Object.entries(clean)) db.prepare(`UPDATE orders SET ${EDITABLE[k]} = ?, updated_at = ? WHERE id = ?`).run(v, now(), order.id);
+  const fresh = getOrderById(order.id);
+  recordEvent(order.id, 'TERMS_EDITED', null, null, { fields: Object.keys(clean), previousHash: before, agreementHash: agreementHash(fresh) });
+  recordEvent(order.id, 'AGREEMENT_ACCEPTED', null, null, { by: 'SELLER', agreementHash: agreementHash(fresh) });
+  return fresh;
+}
+
+/** After the buyer accepted, changes need a new agreement the buyer explicitly accepts — and only before funding. */
+export function proposeAmendment(order, { userId, changes }) {
+  if (order.state !== STATES.AWAITING_FUNDING || hasFundingObserved(order.id)) {
+    throw httpError(409, 'Terms are locked once funding has started');
+  }
+  const clean = validateChanges(changes);
+  db.prepare("UPDATE amendments SET status = 'SUPERSEDED', decided_at = ? WHERE order_id = ? AND status = 'PROPOSED'").run(now(), order.id);
+  const id = uid('amd');
+  db.prepare('INSERT INTO amendments (id, order_id, proposed_by, changes, new_hash, status, created_at) VALUES (?,?,?,?,?,?,?)')
+    .run(id, order.id, userId, JSON.stringify(clean), agreementHash(withChanges(order, clean)), 'PROPOSED', now());
+  recordEvent(order.id, 'AMENDMENT_PROPOSED', null, null, { amendmentId: id, fields: Object.keys(clean) });
+  sendNotification(order.id, 'BUYER', 'AMENDMENT_PROPOSED', `${order.ref}: the seller proposed changes to the agreement. Review and accept or reject before funding.`);
+  return db.prepare('SELECT * FROM amendments WHERE id = ?').get(id);
+}
+
+export function respondAmendment(order, { amendmentId, accept, agreementHash: acceptedHash }) {
+  const a = db.prepare("SELECT * FROM amendments WHERE id = ? AND order_id = ? AND status = 'PROPOSED'").get(amendmentId, order.id);
+  if (!a) throw httpError(404, 'No pending amendment with that id');
+  if (!accept) {
+    db.prepare("UPDATE amendments SET status = 'REJECTED', decided_at = ? WHERE id = ?").run(now(), a.id);
+    recordEvent(order.id, 'AMENDMENT_REJECTED', null, null, { amendmentId: a.id });
+    return { order, amendment: db.prepare('SELECT * FROM amendments WHERE id = ?').get(a.id) };
+  }
+  if (order.state !== STATES.AWAITING_FUNDING || hasFundingObserved(order.id)) throw httpError(409, 'Terms are locked once funding has started');
+  if (acceptedHash !== a.new_hash) throw httpError(409, 'agreementHash must match the amended terms');
+  const changes = JSON.parse(a.changes);
+  const before = agreementHash(order);
+  for (const [k, v] of Object.entries(changes)) db.prepare(`UPDATE orders SET ${EDITABLE[k]} = ?, updated_at = ? WHERE id = ?`).run(v, now(), order.id);
+  db.prepare("UPDATE amendments SET status = 'ACCEPTED', decided_at = ? WHERE id = ?").run(now(), a.id);
+  recordEvent(order.id, 'AMENDMENT_ACCEPTED', null, null, { amendmentId: a.id, previousHash: before, agreementHash: a.new_hash });
+  return { order: getOrderById(order.id), amendment: db.prepare('SELECT * FROM amendments WHERE id = ?').get(a.id) };
+}
+
+export function listAmendments(orderId) {
+  return db.prepare('SELECT * FROM amendments WHERE order_id = ? ORDER BY created_at ASC').all(orderId)
+    .map((a) => ({ id: a.id, changes: parse(a.changes), agreementHash: a.new_hash, status: a.status, createdAt: a.created_at, decidedAt: a.decided_at }));
+}
+
+/* ─────────────── users' view of their transactions ─────────────── */
+
+export function listOrdersForUser(userId, { role } = {}) {
+  const cols = { SELLER: 'seller_user_id', BUYER: 'buyer_user_id', ARBITRATOR: 'arbitrator_user_id' };
+  const where = role && cols[role] ? `${cols[role]} = ?` : 'seller_user_id = ? OR buyer_user_id = ? OR arbitrator_user_id = ?';
+  const args = role && cols[role] ? [userId] : [userId, userId, userId];
+  return db.prepare(`SELECT * FROM orders WHERE ${where} ORDER BY created_at DESC`).all(...args);
+}
+
+export function summarizeOrder(order, roles) {
+  return {
+    ref: order.ref, itemDescription: order.item_description, amountSats: order.amount_sats,
+    state: order.state, stateLabel: STATE_LABELS[order.state] || order.state, roles: [...roles],
+    createdAt: order.created_at, updatedAt: order.updated_at, transactionLink: `${config.appBaseUrl}/t/${order.ref}`,
+  };
+}
+
+/** What anyone holding the link (even logged out) may see: the agreement and the escrow to verify. */
+export function serializePublic(order) {
+  const escrow = getEscrowByOrderId(order.id);
+  const seller = listParticipants(order.id).find((p) => p.role === 'SELLER');
+  return {
+    view: 'PUBLIC',
+    ref: order.ref, itemDescription: order.item_description, amountSats: order.amount_sats,
+    deliveryConditions: order.delivery_conditions, expectedDeliveryAt: order.expected_delivery_at, disputeTerms: order.dispute_terms,
+    sellerName: order.seller_name, state: order.state, stateLabel: STATE_LABELS[order.state] || order.state,
+    bitcoinNetwork: config.bitcoin.network, bitcoinLive,
+    agreementHash: agreementHash(order), openForBuyer: !order.buyer_user_id && !order.buyer_pubkey && (order.state === STATES.CREATED || (!bitcoinLive && order.state === STATES.AWAITING_FUNDING)),
+    sellerNostrPubkey: seller?.nostr_pubkey || null,
+    escrow: escrow ? { address: escrow.address, network: escrow.network } : null,
+    createdAt: order.created_at,
+  };
 }

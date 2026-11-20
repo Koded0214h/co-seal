@@ -12,14 +12,15 @@ const storage = multer.diskStorage({
   },
 });
 
-const ALLOWED = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
+const ALLOWED = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'application/pdf']);
+export const MAX_FILES = 5;
 
 export const upload = multer({
   storage,
   limits: { fileSize: 12 * 1024 * 1024 }, // 12MB
   fileFilter: (_req, file, cb) => {
     if (ALLOWED.has(file.mimetype)) return cb(null, true);
-    cb(new Error('Only image files (jpeg, png, webp, gif) are accepted as evidence.'));
+    cb(Object.assign(new Error('Only images (jpeg, png, webp, gif) and PDF documents are accepted as evidence.'), { status: 415 }));
   },
 });
 
@@ -35,6 +36,12 @@ export function hashUploadedFile(filename) {
 
 /** Detect the real image type from magic bytes — the client-supplied mimetype is not trusted. */
 export function sniffImageType(filename) {
+  const t = sniffFileType(filename);
+  return t && t.startsWith('image/') ? t : null;
+}
+
+/** Real type from magic bytes: images or PDF. */
+export function sniffFileType(filename) {
   const fd = fs.openSync(path.join(config.paths.uploads, filename), 'r');
   const b = Buffer.alloc(12);
   fs.readSync(fd, b, 0, 12, 0);
@@ -43,6 +50,7 @@ export function sniffImageType(filename) {
   if (b.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return 'image/png';
   if (b.subarray(0, 4).toString('latin1') === 'RIFF' && b.subarray(8, 12).toString('latin1') === 'WEBP') return 'image/webp';
   if (['GIF87a', 'GIF89a'].includes(b.subarray(0, 6).toString('latin1'))) return 'image/gif';
+  if (b.subarray(0, 5).toString('latin1') === '%PDF-') return 'application/pdf';
   return null;
 }
 

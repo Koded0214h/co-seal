@@ -163,7 +163,7 @@ test('dispute path: buyer+seller cannot release; arbitrator+seller can', async (
   const order = await freshOrder(200_000);
   await fundAndDeliver(order);
   svc.openDispute(get(order), { category: 'WRONG_ITEM', reason: 'Not what I ordered' });
-  svc.sellerRespondToDispute(get(order), { response: 'CONTEST' });
+  await svc.sellerRespondToDispute(get(order), { response: 'CONTEST' });
   const { settlement } = await svc.resolveByArbitrator(get(order), { decision: 'RELEASE', note: 'Evidence favours seller' });
   assert.equal(get(order).state, 'AWAITING_SIGNATURES');
 
@@ -183,7 +183,7 @@ test('arbitrated REFUND pays the buyer and needs buyer+arbitrator', async () => 
   const order = await freshOrder(150_000);
   await fundAndDeliver(order);
   svc.openDispute(get(order), { category: 'NOT_RECEIVED', reason: 'Never came' });
-  svc.sellerRespondToDispute(get(order), { response: 'CONTEST' });
+  await svc.sellerRespondToDispute(get(order), { response: 'CONTEST' });
   const { settlement } = await svc.resolveByArbitrator(get(order), { decision: 'REFUND', note: 'ok' });
   const view = btc.inspectPsbt(settlement.psbt);
   assert.equal(view.outputs[0].address, svc.listParticipants(order.id).find((p) => p.role === 'BUYER').payout_address);
@@ -197,7 +197,7 @@ test('split pays both parties and requires the arbitrator', async () => {
   const order = await freshOrder(300_000);
   await fundAndDeliver(order);
   svc.openDispute(get(order), { category: 'DAMAGED', reason: 'Cracked' });
-  svc.sellerRespondToDispute(get(order), { response: 'CONTEST' });
+  await svc.sellerRespondToDispute(get(order), { response: 'CONTEST' });
   const { settlement } = await svc.resolveByArbitrator(get(order), { decision: 'SPLIT', note: 'half each' });
   const view = btc.inspectPsbt(settlement.psbt);
   assert.equal(view.outputs.length, 2);
